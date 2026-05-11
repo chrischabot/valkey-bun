@@ -1,0 +1,27 @@
+{
+  "name": "valkey-bun",
+  "module": "src/index.ts",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chrischabot/valkey-bun.git"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "test": "bun test tests/",
+    "bench": "bun run bench/bench.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "ioredis": "^5.10.1",
+    "redis": "^5.12.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.49"
+  }
+}
