@@ -1,6 +1,10 @@
+// Arity/args convention: handler `args` EXCLUDES the command name. For
+// `HSETNX key field value` the args array is [key, field, value], so the
+// value payload is args[2] (NOT args[3]).
+
 import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
-import { bytesToKey, keyToBytes, type Database, type StoredValue } from "../store";
+import { bytesToKey, keyToBytes, type Database } from "../store";
 import { matchPattern } from "../pubsub";
 
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
@@ -196,6 +200,7 @@ export const hashCommands: CommandSpec[] = [
     name: "HSETNX",
     arity: 4,
     handler: (ctx, conn, args) => {
+      // args = [key, field, value] (command name excluded). Value is args[2].
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       const h = getOrCreateHash(d, k);
@@ -249,20 +254,30 @@ export const hashCommands: CommandSpec[] = [
     handler: (ctx, conn, args) => {
       const h = getHash(db(ctx, conn), bytesToKey(args[0]!));
       if (!h || h.size === 0) return args.length > 1 ? RESP.arr([]) : RESP.nil();
+      const fields = Array.from(h.keys());
       if (args.length === 1) {
-        const arr = Array.from(h.keys());
-        return { type: "bulk", value: keyToBytes(arr[Math.floor(Math.random() * arr.length)]!) };
+        return { type: "bulk", value: keyToBytes(fields[Math.floor(Math.random() * fields.length)]!) };
       }
       const count = Number(dec(args[1]!));
       const withValues = args.length > 2 && dec(args[2]!).toUpperCase() === "WITHVALUES";
-      const fields = Array.from(h.keys());
       const out: RespValue[] = [];
-      const n = Math.abs(count);
-      for (let i = 0; i < n; i++) {
-        const idx = count < 0 ? Math.floor(Math.random() * fields.length) : i % fields.length;
-        const f = fields[idx]!;
+      const push = (f: string) => {
         out.push({ type: "bulk", value: keyToBytes(f) });
         if (withValues) out.push({ type: "bulk", value: h.get(f)! });
+      };
+      if (count >= 0) {
+        // Distinct fields, sampled without replacement (Fisher-Yates partial).
+        const pool = fields.slice();
+        const n = Math.min(count, pool.length);
+        for (let i = 0; i < n; i++) {
+          const j = i + Math.floor(Math.random() * (pool.length - i));
+          const t = pool[i]!; pool[i] = pool[j]!; pool[j] = t;
+          push(pool[i]!);
+        }
+      } else {
+        // Negative count: allow repeats.
+        const n = -count;
+        for (let i = 0; i < n; i++) push(fields[Math.floor(Math.random() * fields.length)]!);
       }
       return RESP.arr(out);
     },

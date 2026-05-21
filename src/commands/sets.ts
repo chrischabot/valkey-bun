@@ -7,6 +7,10 @@ const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 function db(ctx: any, conn: any): Database { return ctx.store.db(conn.selectedDb); }
 
+function emptySetReply(conn: any): RespValue {
+  return conn.resp3 ? { type: "set", value: [] } : RESP.arr([]);
+}
+
 function getSet(d: Database, key: string): Set<string> | null {
   const v = d.getRaw(key);
   if (!v) return null;
@@ -42,10 +46,7 @@ export const setCommands: CommandSpec[] = [
       let n = 0;
       for (let i = 1; i < args.length; i++) {
         const m = bytesToKey(args[i]!);
-        if (!s.has(m)) {
-          s.add(m);
-          n++;
-        }
+        if (!s.has(m)) { s.add(m); n++; }
       }
       ctx.bumpKey(conn.selectedDb, k);
       return RESP.int(n);
@@ -71,7 +72,7 @@ export const setCommands: CommandSpec[] = [
     arity: 2,
     handler: (ctx, conn, args) => {
       const s = getSet(db(ctx, conn), bytesToKey(args[0]!));
-      if (!s) return conn.resp3 ? { type: "set", value: [] } : RESP.arr([]);
+      if (!s) return emptySetReply(conn);
       const arr = membersToArr(s);
       return conn.resp3 ? { type: "set", value: arr } : RESP.arr(arr);
     },
@@ -136,8 +137,7 @@ export const setCommands: CommandSpec[] = [
       if (!s || s.size === 0) return args.length > 1 ? RESP.arr([]) : RESP.nil();
       const arr = Array.from(s);
       if (args.length === 1) {
-        const m = arr[Math.floor(Math.random() * arr.length)]!;
-        return { type: "bulk", value: keyToBytes(m) };
+        return { type: "bulk", value: keyToBytes(arr[Math.floor(Math.random() * arr.length)]!) };
       }
       const count = Number(dec(args[1]!));
       const out: RespValue[] = [];
@@ -176,7 +176,7 @@ export const setCommands: CommandSpec[] = [
     handler: (ctx, conn, args) => {
       const d = db(ctx, conn);
       const sets = args.map((a) => getSet(d, bytesToKey(a)));
-      if (sets.some((s) => !s)) return RESP.arr([]);
+      if (sets.some((s) => !s)) return emptySetReply(conn);
       let inter = new Set(sets[0]!);
       for (let i = 1; i < sets.length; i++) {
         const next = new Set<string>();
@@ -193,7 +193,7 @@ export const setCommands: CommandSpec[] = [
     handler: (ctx, conn, args) => {
       const d = db(ctx, conn);
       const first = getSet(d, bytesToKey(args[0]!));
-      if (!first) return RESP.arr([]);
+      if (!first) return emptySetReply(conn);
       const out = new Set(first);
       for (let i = 1; i < args.length; i++) {
         const s = getSet(d, bytesToKey(args[i]!));
@@ -203,21 +203,9 @@ export const setCommands: CommandSpec[] = [
       return conn.resp3 ? { type: "set", value: arr } : RESP.arr(arr);
     },
   },
-  {
-    name: "SUNIONSTORE",
-    arity: -3,
-    handler: (ctx, conn, args) => storeOp(ctx, conn, args, "union"),
-  },
-  {
-    name: "SINTERSTORE",
-    arity: -3,
-    handler: (ctx, conn, args) => storeOp(ctx, conn, args, "inter"),
-  },
-  {
-    name: "SDIFFSTORE",
-    arity: -3,
-    handler: (ctx, conn, args) => storeOp(ctx, conn, args, "diff"),
-  },
+  { name: "SUNIONSTORE", arity: -3, handler: (ctx, conn, args) => storeOp(ctx, conn, args, "union") },
+  { name: "SINTERSTORE", arity: -3, handler: (ctx, conn, args) => storeOp(ctx, conn, args, "inter") },
+  { name: "SDIFFSTORE", arity: -3, handler: (ctx, conn, args) => storeOp(ctx, conn, args, "diff") },
   {
     name: "SMOVE",
     arity: 4,
@@ -296,6 +284,7 @@ function storeOp(ctx: any, conn: any, args: Uint8Array[], op: "union" | "inter" 
   } else if (op === "inter") {
     if (sets.some((s) => !s)) {
       d.delete(dest);
+      ctx.bumpKey(conn.selectedDb, dest);
       return RESP.int(0);
     }
     result = new Set(sets[0]!);

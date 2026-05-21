@@ -1,18 +1,28 @@
 import type { Socket } from "bun";
 import { Connection } from "./connection";
 import { parse, parseCommand, RESP, toStr } from "./resp";
-import { ServerContext, type ServerConfig } from "./server-context";
+import { ServerContext } from "./server-context";
+import type { ResolvedConfig } from "./config";
 import { buildRegistry, dispatch, dispatchSync } from "./commands";
 import { setTransactionRegistry } from "./commands/transactions";
 
 const ENCODER = new TextEncoder();
 const EMPTY = new Uint8Array(0);
 
-export function startServer(config: ServerConfig & { reusePort?: boolean } = {} as any) {
+// The Bun TCP listener exposes stop(); callers only need that on the data
+// plane. Narrowing here avoids depending on the Bun TCP|Unix listener union.
+export interface RunningServer {
+  server: { stop: (closeActiveConnections?: boolean) => void };
+  ctx: ServerContext;
+}
+
+export function startTcpServer(config: ResolvedConfig & { reusePort?: boolean }): RunningServer {
   const ctx = new ServerContext(config);
   const registry = buildRegistry();
   setTransactionRegistry(registry);
 
+  // Per-connection async tail. When set, subsequent commands MUST defer to
+  // preserve reply order; the value is the chained promise of pending work.
   const queues = new WeakMap<Connection, Promise<unknown>>();
 
   function deferAsync(conn: Connection, work: () => Promise<unknown>): void {
@@ -21,8 +31,7 @@ export function startServer(config: ServerConfig & { reusePort?: boolean } = {} 
       .then(() => work())
       .then(() => conn.flush())
       .catch((e) => {
-        // Surface unexpected errors so they're not silently lost.
-        console.error("[valkey-bun] async dispatch error:", e);
+        console.error("[valkey2] async dispatch error:", e);
       });
     queues.set(conn, next);
     next.finally(() => {
@@ -30,26 +39,33 @@ export function startServer(config: ServerConfig & { reusePort?: boolean } = {} 
     });
   }
 
-  const server = Bun.listen<{ conn: Connection }>({
+  // Bun supports `reusePort` on Bun.listen at runtime, but the bundled
+  // bun-types narrows the listen-options union and omits it. Build the
+  // options object first, then pass it through a single localized boundary
+  // cast so the runtime-valid flag is accepted without weakening anything
+  // else. Behavior is identical to a direct typed call.
+  const listenOptions = {
     hostname: config.host,
     port: config.port,
     reusePort: config.reusePort ?? false,
     socket: {
-      open(socket) {
-        const conn = new Connection(socket as Socket<unknown>);
+      open(socket: Socket<{ conn: Connection }>) {
+        const conn = new Connection(socket as unknown as Socket<unknown>);
         socket.data = { conn };
         ctx.connections.add(conn);
       },
-      data(socket, data) {
+      data(socket: Socket<{ conn: Connection }>, data: Uint8Array) {
         const conn = socket.data.conn;
         conn.appendData(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
         while (true) {
+          // Fast path: typical "*N\r\n($L\r\nbytes\r\n)+" command frame.
           const fast = parseCommand(conn.buffer);
           let name: string;
           let args: Uint8Array[];
           let consumed: number;
-          if (fast === null) break;
+          if (fast === null) break; // incomplete
           if (fast === false) {
+            // Unusual frame (inline command / RESP3 mixed) - general parser.
             const r = parse(conn.buffer);
             if (!r) break;
             consumed = r.next;
@@ -80,13 +96,12 @@ export function startServer(config: ServerConfig & { reusePort?: boolean } = {} 
             deferAsync(conn, () => dispatch(ctx, conn, registry, name, args));
             continue;
           }
-
           const maybe = dispatchSync(ctx, conn, registry, name, args);
           if (maybe) deferAsync(conn, () => maybe);
         }
         conn.flush();
       },
-      close(socket) {
+      close(socket: Socket<{ conn: Connection }>) {
         const conn = socket.data?.conn;
         if (conn) {
           ctx.pubsub.removeConnection(conn);
@@ -94,7 +109,7 @@ export function startServer(config: ServerConfig & { reusePort?: boolean } = {} 
           conn.closed = true;
         }
       },
-      error(socket, _err) {
+      error(socket: Socket<{ conn: Connection }>) {
         const conn = socket.data?.conn;
         if (conn) {
           ctx.pubsub.removeConnection(conn);
@@ -103,7 +118,11 @@ export function startServer(config: ServerConfig & { reusePort?: boolean } = {} 
         }
       },
     },
-  });
+  };
+
+  const server = Bun.listen(
+    listenOptions as unknown as Parameters<typeof Bun.listen>[0],
+  ) as unknown as { stop: (closeActiveConnections?: boolean) => void };
 
   const sweepTimer = setInterval(() => {
     for (const d of ctx.store.dbs) d.sweepLazy();

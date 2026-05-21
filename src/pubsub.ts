@@ -47,23 +47,23 @@ export class PubSub {
   }
 
   publish(channel: string, message: Uint8Array): number {
-    let n = 0;
+    const seen = new Set<Connection>();
     const subs = this.channels.get(channel);
     if (subs) {
       for (const conn of subs) {
         conn.sendMessage(channel, message);
-        n++;
+        seen.add(conn);
       }
     }
     for (const [pattern, pSubs] of this.patterns) {
       if (matchPattern(pattern, channel)) {
         for (const conn of pSubs) {
           conn.sendPMessage(pattern, channel, message);
-          n++;
+          seen.add(conn);
         }
       }
     }
-    return n;
+    return seen.size;
   }
 
   removeConnection(conn: Connection): void {
@@ -102,7 +102,6 @@ export class PubSub {
   }
 }
 
-// glob-style matcher supporting *, ?, [abc]
 export function matchPattern(pattern: string, str: string): boolean {
   return globMatch(pattern, 0, str, 0);
 }
@@ -135,7 +134,7 @@ function globMatch(p: string, pi: number, s: string, si: number): boolean {
       let matched = false;
       for (let i = 0; i < body.length; i++) {
         if (body[i + 1] === "-" && i + 2 < body.length) {
-          if (s[si] >= body[i] && s[si] <= body[i + 2]) matched = true;
+          if (s[si]! >= body[i]! && s[si]! <= body[i + 2]!) matched = true;
           i += 2;
         } else if (body[i] === s[si]) {
           matched = true;

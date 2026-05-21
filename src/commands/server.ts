@@ -15,12 +15,12 @@ export const serverCommands: CommandSpec[] = [
           redis_version: "7.4.0",
           redis_git_sha1: "00000000",
           redis_git_dirty: 0,
-          redis_build_id: "valkey-bun",
+          redis_build_id: "valkey2",
           redis_mode: "standalone",
           os: "Linux",
           arch_bits: 64,
           process_id: process.pid,
-          run_id: "valkey-bun-" + ctx.startTime.toString(16),
+          run_id: "valkey2-" + ctx.startTime.toString(16),
           tcp_port: ctx.config.port,
           uptime_in_seconds: uptime,
           uptime_in_days: Math.floor(uptime / 86400),
@@ -37,7 +37,11 @@ export const serverCommands: CommandSpec[] = [
           maxmemory_policy: "noeviction",
         },
         Persistence: { loading: 0, rdb_changes_since_last_save: 0, rdb_bgsave_in_progress: 0, aof_enabled: 0 },
-        Stats: { total_connections_received: ctx.connections.size, total_commands_processed: 0, instantaneous_ops_per_sec: 0 },
+        Stats: {
+          total_connections_received: ctx.connections.size,
+          total_commands_processed: ctx.totalCommands,
+          instantaneous_ops_per_sec: 0,
+        },
         Replication: { role: "master", connected_slaves: 0, master_replid: "0".repeat(40), master_repl_offset: 0 },
         CPU: { used_cpu_sys: 0, used_cpu_user: 0 },
         Keyspace: {},
@@ -200,35 +204,14 @@ export const serverCommands: CommandSpec[] = [
     name: "SWAPDB",
     arity: 3,
     handler: (ctx, _conn, args) => {
-      const aStr = dec(args[0]!);
-      const bStr = dec(args[1]!);
-      const a = Number(aStr);
-      const b = Number(bStr);
+      const a = Number(dec(args[0]!));
+      const b = Number(dec(args[1]!));
       if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 ||
           a >= ctx.store.dbs.length || b >= ctx.store.dbs.length) {
         return RESP.err("ERR DB index is out of range");
       }
       [ctx.store.dbs[a], ctx.store.dbs[b]] = [ctx.store.dbs[b]!, ctx.store.dbs[a]!];
       return RESP.ok();
-    },
-  },
-  {
-    name: "MOVE",
-    arity: 3,
-    handler: (ctx, conn, args) => {
-      const dbIdx = Number(dec(args[1]!));
-      if (!Number.isInteger(dbIdx) || dbIdx < 0 || dbIdx >= ctx.store.dbs.length) {
-        return RESP.err("ERR DB index is out of range");
-      }
-      const src = ctx.store.db(conn.selectedDb);
-      const dst = ctx.store.db(dbIdx);
-      const key = dec(args[0]!);
-      const v = src.getRaw(key);
-      if (!v) return RESP.int(0);
-      if (dst.exists(key)) return RESP.int(0);
-      dst.set(key, v);
-      src.delete(key);
-      return RESP.int(1);
     },
   },
 ];

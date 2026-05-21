@@ -1,13 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createClient } from "redis";
-import { startServer } from "../src/server";
+import { startTcpServer } from "../src/tcp-server";
 
-const PORT = 16381;
-let server: ReturnType<typeof startServer>;
+const PORT = 16481;
+let server: ReturnType<typeof startTcpServer>;
 let r: ReturnType<typeof createClient>;
 
 beforeAll(async () => {
-  server = startServer({ host: "127.0.0.1", port: PORT, password: null, maxClients: 1000, dbCount: 16 });
+  server = startTcpServer({
+    host: "127.0.0.1", port: PORT, password: null,
+    maxClients: 1000, dbCount: 16, clusterSize: 1, adminPort: 0,
+  });
   r = createClient({ url: `redis://127.0.0.1:${PORT}`, RESP: 3 });
   await r.connect();
 });
@@ -55,7 +58,7 @@ describe("node-redis: lists", () => {
 });
 
 describe("node-redis: sets", () => {
-  test("SADD/SMEMBERS/SISMEMBER", async () => {
+  test("SADD/SMEMBERS/SISMEMBER (RESP3 boolean)", async () => {
     await r.del("s");
     expect(await r.sAdd("s", ["a", "b", "c"])).toBe(3);
     expect((await r.sMembers("s")).sort()).toEqual(["a", "b", "c"]);
@@ -64,7 +67,7 @@ describe("node-redis: sets", () => {
 });
 
 describe("node-redis: sorted sets", () => {
-  test("ZADD/ZRANGE/ZSCORE", async () => {
+  test("ZADD/ZRANGE/ZSCORE (RESP3 double)", async () => {
     await r.del("z");
     await r.zAdd("z", [
       { score: 1, value: "a" },
@@ -89,12 +92,10 @@ describe("node-redis: pubsub", () => {
     const sub = r.duplicate();
     await sub.connect();
     const received: Array<[string, string]> = [];
-    await sub.subscribe("nrchan", (message, channel) => {
-      received.push([channel, message]);
-    });
-    await new Promise((r2) => setTimeout(r2, 50));
+    await sub.subscribe("nrchan", (message, channel) => received.push([channel, message]));
+    await new Promise((res) => setTimeout(res, 50));
     expect(await r.publish("nrchan", "hello")).toBe(1);
-    await new Promise((r2) => setTimeout(r2, 100));
+    await new Promise((res) => setTimeout(res, 100));
     expect(received).toEqual([["nrchan", "hello"]]);
     await sub.quit();
   });
@@ -103,7 +104,6 @@ describe("node-redis: pubsub", () => {
 describe("node-redis: server", () => {
   test("INFO/PING", async () => {
     expect(await r.ping()).toBe("PONG");
-    const info = await r.info();
-    expect(info).toContain("redis_version");
+    expect(await r.info()).toContain("redis_version");
   });
 });

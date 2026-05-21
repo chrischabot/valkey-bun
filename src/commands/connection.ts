@@ -54,9 +54,14 @@ export const connectionCommands: CommandSpec[] = [
           const opt = dec(args[i]!).toUpperCase();
           if (opt === "AUTH") {
             if (i + 2 >= args.length) return RESP.err("ERR Syntax error: AUTH requires username and password");
-            const _user = dec(args[i + 1]!);
             const pass = dec(args[i + 2]!);
-            if (ctx.config.password && pass !== ctx.config.password) {
+            // Behave consistently with the AUTH command: only a configured,
+            // matching password authenticates. A passwordless server does not
+            // elevate the connection (and rejects an explicit wrong password).
+            if (!ctx.config.password) {
+              return RESP.err("ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+            }
+            if (pass !== ctx.config.password) {
               return RESP.err("WRONGPASS invalid username-password pair or user is disabled.");
             }
             conn.authenticated = true;
@@ -109,7 +114,9 @@ export const connectionCommands: CommandSpec[] = [
         case "ID": return RESP.int(conn.id);
         case "INFO": return RESP.str(`id=${conn.id} name=${conn.name} db=${conn.selectedDb}`);
         case "LIST": {
-          const lines = Array.from(ctx.connections).map((c: any) => `id=${c.id} name=${c.name} db=${c.selectedDb}`);
+          const lines = Array.from(ctx.connections).map(
+            (c: any) => `id=${c.id} name=${c.name} db=${c.selectedDb}`,
+          );
           return RESP.str(lines.join("\n"));
         }
         case "NO-EVICT": case "NO-TOUCH": case "REPLY": case "PAUSE":

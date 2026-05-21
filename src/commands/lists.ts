@@ -1,9 +1,6 @@
-// Arity convention in this codebase:
-//   The dispatcher computes `got = 1 + args.length` and compares to
-//   `spec.arity`. So arity counts the command name plus its arguments.
-//   For example LSET key index value -> arity 4 (command + 3 args).
-//   LINSERT key BEFORE|AFTER pivot value -> arity 5 (command + 4 args).
-//   Negative arity n means "at least |n| total tokens".
+// Arity convention: dispatcher computes got = 1 + args.length vs spec.arity,
+// so arity counts command name + args; handler `args` excludes the command
+// name. LINSERT key BEFORE|AFTER pivot value -> arity 5, args length 4.
 
 import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
@@ -47,6 +44,7 @@ export const listCommands: CommandSpec[] = [
       const list = getOrCreateList(d, k);
       for (let i = 1; i < args.length; i++) list.unshift(new Uint8Array(args[i]!));
       ctx.bumpKey(conn.selectedDb, k);
+      ctx.notifyListPush(conn.selectedDb, k);
       return RESP.int(list.length);
     },
   },
@@ -59,6 +57,7 @@ export const listCommands: CommandSpec[] = [
       const list = getOrCreateList(d, k);
       for (let i = 1; i < args.length; i++) list.push(new Uint8Array(args[i]!));
       ctx.bumpKey(conn.selectedDb, k);
+      ctx.notifyListPush(conn.selectedDb, k);
       return RESP.int(list.length);
     },
   },
@@ -72,6 +71,7 @@ export const listCommands: CommandSpec[] = [
       if (!list) return RESP.int(0);
       for (let i = 1; i < args.length; i++) list.unshift(new Uint8Array(args[i]!));
       ctx.bumpKey(conn.selectedDb, k);
+      ctx.notifyListPush(conn.selectedDb, k);
       return RESP.int(list.length);
     },
   },
@@ -85,6 +85,7 @@ export const listCommands: CommandSpec[] = [
       if (!list) return RESP.int(0);
       for (let i = 1; i < args.length; i++) list.push(new Uint8Array(args[i]!));
       ctx.bumpKey(conn.selectedDb, k);
+      ctx.notifyListPush(conn.selectedDb, k);
       return RESP.int(list.length);
     },
   },
@@ -172,7 +173,7 @@ export const listCommands: CommandSpec[] = [
         }
       }
       if (list.length === 0) d.delete(k);
-      ctx.bumpKey(conn.selectedDb, k);
+      if (removed > 0) ctx.bumpKey(conn.selectedDb, k);
       return RESP.int(removed);
     },
   },
@@ -199,8 +200,7 @@ export const listCommands: CommandSpec[] = [
     },
   },
   {
-    // LINSERT key BEFORE|AFTER pivot value -> 4 arguments after the command
-    // name; arity counts command name + arguments per the dispatcher contract.
+    // LINSERT key BEFORE|AFTER pivot value -> arity 5 (command + 4 args).
     name: "LINSERT",
     arity: 5,
     handler: (ctx, conn, args) => {
@@ -223,19 +223,23 @@ export const listCommands: CommandSpec[] = [
     name: "LMOVE",
     arity: 5,
     handler: (ctx, conn, args) => {
+      const from = dec(args[2]!).toUpperCase();
+      const to = dec(args[3]!).toUpperCase();
+      if ((from !== "LEFT" && from !== "RIGHT") || (to !== "LEFT" && to !== "RIGHT")) {
+        return RESP.err("ERR syntax error");
+      }
       const d = db(ctx, conn);
       const sk = bytesToKey(args[0]!);
       const dk = bytesToKey(args[1]!);
       const src = getList(d, sk);
       if (!src || src.length === 0) return RESP.nil();
-      const from = dec(args[2]!).toUpperCase();
-      const to = dec(args[3]!).toUpperCase();
       const item = from === "LEFT" ? src.shift()! : src.pop()!;
       if (src.length === 0) d.delete(sk);
       const dst = getOrCreateList(d, dk);
       if (to === "LEFT") dst.unshift(item); else dst.push(item);
       ctx.bumpKey(conn.selectedDb, sk);
       ctx.bumpKey(conn.selectedDb, dk);
+      ctx.notifyListPush(conn.selectedDb, dk);
       return { type: "bulk", value: item };
     },
   },
@@ -254,6 +258,7 @@ export const listCommands: CommandSpec[] = [
       dst.unshift(item);
       ctx.bumpKey(conn.selectedDb, sk);
       ctx.bumpKey(conn.selectedDb, dk);
+      ctx.notifyListPush(conn.selectedDb, dk);
       return { type: "bulk", value: item };
     },
   },
@@ -302,7 +307,7 @@ function popN(ctx: any, conn: any, args: Uint8Array[], side: "left" | "right"): 
   const d = db(ctx, conn);
   const k = bytesToKey(args[0]!);
   const list = getList(d, k);
-  if (!list || list.length === 0) return RESP.nil();
+  if (!list || list.length === 0) return args.length > 1 ? RESP.arr(null) : RESP.nil();
   if (args.length === 1) {
     const item = side === "left" ? list.shift()! : list.pop()!;
     if (list.length === 0) d.delete(k);
@@ -320,18 +325,34 @@ function popN(ctx: any, conn: any, args: Uint8Array[], side: "left" | "right"): 
   return RESP.arr(out);
 }
 
-function blockingPop(ctx: any, conn: any, args: Uint8Array[], side: "left" | "right"): RespValue {
-  const keys = args.slice(0, -1);
+// Genuine blocking BLPOP/BRPOP. Returns immediately if an element is
+// available on any key; rejects an invalid/negative timeout with a Redis
+// error; otherwise parks the client via the server-context waiter registry
+// until a push arrives or the timeout elapses (0 => block forever). The async
+// return integrates with the dispatcher's per-connection async queue, so a
+// blocked client correctly defers its subsequent commands.
+async function blockingPop(
+  ctx: any,
+  conn: any,
+  args: Uint8Array[],
+  side: "left" | "right",
+): Promise<RespValue> {
+  const timeoutRaw = Number(dec(args[args.length - 1]!));
+  if (!Number.isFinite(timeoutRaw) || timeoutRaw < 0) {
+    return RESP.err("ERR timeout is not a float or out of range");
+  }
+  const keyBufs = args.slice(0, -1);
+  const keys = keyBufs.map((k) => bytesToKey(k));
   const d = db(ctx, conn);
-  for (const k of keys) {
-    const key = bytesToKey(k);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!;
     const list = getList(d, key);
     if (list && list.length > 0) {
       const item = side === "left" ? list.shift()! : list.pop()!;
       if (list.length === 0) d.delete(key);
       ctx.bumpKey(conn.selectedDb, key);
-      return RESP.arr([{ type: "bulk", value: k }, { type: "bulk", value: item }]);
+      return RESP.arr([{ type: "bulk", value: keyBufs[i]! }, { type: "bulk", value: item }]);
     }
   }
-  return RESP.nil();
+  return ctx.registerListWaiter(conn.selectedDb, keys, side, timeoutRaw) as Promise<RespValue>;
 }

@@ -1,173 +1,139 @@
-# valkey-bun
+# valkey2
 
-`valkey-bun` is a Valkey/Redis-compatible server written in TypeScript for the
-Bun runtime. It exists for the deceptively ordinary case where a local service
-stack needs Redis semantics, but does not really need another container, another
-daemon, or another five seconds of waiting for infrastructure that is only there
-to hold a few session hashes.
+A fast, single-binary, Valkey/Redis-compatible server — a clean reimplementation
+of the original `valkey-bun` with every performance lesson baked in from the
+start, built on **Bun 1.3.14** and structured with **Effect v4** following the
+[effect.solutions](https://www.effect.solutions/) prescriptive guide.
 
-The goal is not to pretend that a TypeScript process is a replacement for a
-production Valkey cluster. The goal is more specific, and therefore more useful:
-an ephemeral, single-binary-ish server that speaks enough Redis protocol for real
-clients to talk to it during local development, tests, demos, and small internal
-tools where the correct persistence story is "please forget this when I stop the
-process."
+## Architecture: Effect at the boundary, raw hot path
 
-## What it does
+Effect v4 governs the **control plane**: typed configuration (`Config` service +
+`Layer`, `Config.redacted` secrets), dependency injection (`Context.Service`),
+domain errors (`Schema.TaggedErrorClass`), structured startup/shutdown, and the
+HTTP/3 admin server. The **data plane** — per-command RESP parse → dispatch →
+encode — is deliberately raw, allocation-conscious TypeScript. Wrapping every
+Redis command in an Effect/Promise was measured (in the predecessor) to cap
+throughput, so the hot loop stays synchronous. This split is the idiomatic
+approach: Effect for orchestration, bare metal for the inner loop.
 
-- Runs on Bun's TCP server with no external Valkey or Redis process.
-- Speaks RESP2 and RESP3, including `HELLO 3`.
-- Stores string, list, hash, set, sorted set, and stream values in memory.
-- Keeps keys and values binary-safe by storing protocol bytes directly.
-- Supports multiple logical databases, key expiry, pub/sub, transactions, and
-  optimistic concurrency with `WATCH`.
-- Works with ordinary clients; the test suite exercises both `ioredis` and
-  `node-redis`.
-- Starts from a small TypeScript codebase that is deliberately easy to inspect,
-  which is part of the point.
+The runtime dependency is the published `effect@4.0.0-beta.70` npm package. The
+full Effect v4 source (`Effect-TS/effect-smol`) was used as the reference while
+building this; clone it into `vendor/effect/` (gitignored, not committed) if you
+want to read the real implementations and types — it is intentionally kept out
+of the repository to keep it focused on the server itself.
 
-There is, of course, a catch: this is intentionally ephemeral. There is no RDB,
-no AOF, no replication, and no cluster sharding. If you are trying to protect
-money, medical records, or a leaderboard your users will riot over, use the real
-thing. If you are trying to make a local app boot without dragging half a
-production stack behind it, this is the shape.
+## Performance lessons applied from the start
+
+1. Per-connection write coalescing — one `socket.write()` per read drain
+2. Synchronous dispatch fast-path — promise queue only for async handlers
+3. Cached pre-encoded replies (`+OK`, `+PONG`, `$-1`, `*0`, small ints, bools)
+4. Buffer-cursor encoder (`encodeInto`) — no per-reply concat
+5. `parseCommand` fast-path — no intermediate `RespValue` allocation
+6. ZSet sorted-entries cache — invalidated only on writes
+7. Native latin1 `TextDecoder` for binary-safe keys
+8. Dual-case command registry — skip per-call `toUpperCase()`
+9. Optional `SO_REUSEPORT` multicore
+
+Additionally, this version implements **genuine blocking `BLPOP`/`BRPOP`** (a
+documented limitation in the predecessor) via an async waiter registry that
+integrates with the per-connection dispatch queue.
 
 ## Quick start
 
 ```bash
 bun install
-bun run start
+bun run start                # RESP TCP 0.0.0.0:6379, admin HTTP/3 on :8080
 ```
 
-By default the server listens on `0.0.0.0:6379`.
+Environment variables:
 
-```ts
-import { Redis } from "ioredis";
+| Var                    | Default   | Purpose                                  |
+|------------------------|-----------|------------------------------------------|
+| `VALKEY_HOST`          | `0.0.0.0` | RESP TCP bind address                    |
+| `VALKEY_PORT`          | `6379`    | RESP TCP port                            |
+| `VALKEY_PASSWORD`      | (none)    | If set, requires `AUTH`                  |
+| `VALKEY_MAXCLIENTS`    | `10000`   | Reported in `INFO`/`CLIENT`              |
+| `VALKEY_DBCOUNT`       | `16`      | Logical databases                        |
+| `VALKEY_ADMIN_PORT`    | `8080`    | HTTP/3 admin endpoint port (TCP+UDP)     |
+| `VALKEY_ADMIN_TLS_KEY` | (none)    | PEM private key for the admin endpoint   |
+| `VALKEY_ADMIN_TLS_CERT`| (none)    | PEM certificate for the admin endpoint   |
+| `VALKEY_CLUSTER_SIZE`  | `1`       | >1 forks N `SO_REUSEPORT` workers        |
 
-const redis = new Redis({ host: "127.0.0.1", port: 6379 });
+## HTTP/3 admin / metrics endpoint
 
-await redis.set("hello", "world");
-console.log(await redis.get("hello"));
-```
+Bun 1.3.14 added **first-class HTTP/3 (QUIC) support to `Bun.serve`**
+([release notes](https://bun.com/blog/bun-v1.3.14#http-3-quic-support-in-bun-serve)).
+The admin server sets `http3: true` alongside `tls`, so Bun binds **TCP for
+HTTP/1.1 + HTTP/2 and UDP for HTTP/3 on the same port**. A single `fetch`
+handler serves all three protocols unchanged; HTTP/1.1 and HTTP/2 responses
+automatically include an `Alt-Svc` header so clients discover and upgrade to
+the QUIC endpoint. HTTP/3 is experimental in Bun 1.3.x.
 
-The same server can also be used with `node-redis`:
+QUIC mandates TLS. The admin server resolves its certificate as follows:
 
-```ts
-import { createClient } from "redis";
-
-const redis = createClient({ url: "redis://127.0.0.1:6379", RESP: 3 });
-await redis.connect();
-
-await redis.hSet("session:abc", { user_id: "42", role: "admin" });
-console.log(await redis.hGetAll("session:abc"));
-
-await redis.quit();
-```
-
-## Configuration
-
-Configuration is intentionally boring. Set environment variables, start the
-process, and the server reports the resulting values through compatibility
-commands such as `INFO`, `CONFIG`, and `CLIENT`.
-
-| Variable | Default | Purpose |
-| --- | ---: | --- |
-| `VALKEY_HOST` | `0.0.0.0` | Bind address. |
-| `VALKEY_PORT` | `6379` | Bind port. |
-| `VALKEY_PASSWORD` | none | Enables `AUTH` when set. |
-| `VALKEY_MAXCLIENTS` | `10000` | Reported in compatibility metadata. |
-| `VALKEY_DBCOUNT` | `16` | Number of logical databases. |
-| `VALKEY_CLUSTER_SIZE` | `1` | Forks multiple Bun workers with `reusePort` when greater than `1`. |
-
-Example:
+1. If `VALKEY_ADMIN_TLS_KEY` and `VALKEY_ADMIN_TLS_CERT` are set, those PEM
+   files are used.
+2. Otherwise a self-signed dev certificate is generated once into `.certs/`
+   (gitignored) on first boot via `openssl`.
 
 ```bash
-VALKEY_HOST=127.0.0.1 VALKEY_PORT=16379 VALKEY_PASSWORD=local bun run start
+# HTTP/3 (QUIC) — requires a curl built with HTTP/3 support
+curl --http3-only -sk https://localhost:8080/health
+curl --http3-only -sk https://localhost:8080/info
+curl --http3-only -sk https://localhost:8080/metrics    # Prometheus text
+
+# The same endpoint also answers HTTP/2 and HTTP/1.1 over TLS on the same port;
+# TCP responses advertise the QUIC endpoint via Alt-Svc:
+curl -skI https://localhost:8080/health | grep -i alt-svc
 ```
 
-## Command coverage
-
-The server implements the command families that tend to show up in local app
-stacks first: strings, keys, hashes, lists, sets, sorted sets, streams, pub/sub,
-transactions, connection commands, and server/configuration commands. The tests
-cover normal application-shaped use cases such as sessions with TTLs, counters
-under contention, leaderboards, pub/sub event delivery, watched transactions,
-queues, and stream logs.
-
-The complete command registry is built from `src/commands/`. If you want the
-literal list from the current checkout:
+## Tests
 
 ```bash
-bun -e 'import { buildRegistry } from "./src/commands"; console.log(buildRegistry().list().map(c => c.name).sort().join("\n"))'
+bun test
 ```
 
-Some compatibility commands are implemented as stubs because many clients probe
-for them even when the local workload does not need the full behavior. That is a
-practical compromise, not a secret production roadmap.
+Three suites run the server in-process and exercise it through the official
+`ioredis` SDK, the official `redis` (node-redis, RESP3) SDK, and a realistic
+sample-app suite (sessions, leaderboards, a multi-subscriber pub/sub bus, a
+WATCH money transfer, a genuinely-blocking work queue, streams).
+
+## Benchmark
+
+```bash
+BENCH_SECONDS=300 bun run bench
+```
+
+Production-realistic weighted 16-command mix, 32 pipelined clients, with
+per-command p50/p90/p99 histograms and `/proc`-sampled server RSS/CPU.
+
+## Multicore
+
+```bash
+VALKEY_CLUSTER_SIZE=2 bun run start
+```
+
+Forks N workers sharing the RESP TCP port via Linux `SO_REUSEPORT`; the kernel
+load-balances connections. Each worker has independent state, so this suits
+connection-affinity workloads (per-client caches/counters, sticky sessions).
+The HTTP/3 admin endpoint binds only on worker 0 to avoid `EADDRINUSE`.
+
+## Supported commands
+
+Strings, generic keys, hashes, lists (incl. real blocking `BLPOP`/`BRPOP`),
+sets, sorted sets, streams (incl. consumer groups), pub/sub (incl. sharded),
+transactions (`MULTI`/`EXEC`/`WATCH`), connection
+(`PING`/`AUTH`/`HELLO`/`SELECT`/`CLIENT`), and server commands
+(`INFO`/`COMMAND`/`CONFIG`/`DEBUG`/`TIME`/`MEMORY`/`LATENCY`/`SLOWLOG`/
+`CLUSTER`/`SWAPDB`/...). Both RESP2 and RESP3 are supported; `HELLO 3` upgrades.
 
 ## Known limitations
 
-- No persistence: data lives in memory and disappears when the process exits.
-- No replication, Sentinel, or cluster sharding.
-- `EVAL`, `EVALSHA`, `FCALL`, and related scripting/function commands return an
-  explicit unsupported response or compatibility stub.
-- Blocking commands such as `BLPOP`, `BRPOP`, and `XREAD BLOCK` currently return
-  immediately rather than parking the connection.
-- Server introspection commands such as `INFO`, `COMMAND`, `MEMORY`, `LATENCY`,
-  `SLOWLOG`, and `CLUSTER` provide the compatibility surface needed by common
-  clients, not the full operational universe of Valkey.
-
-In other words, the project is useful precisely because it is small, but the
-smallness is a product boundary. It is not an invitation to discover durability
-the hard way.
-
-## Architecture
-
-The code is organized around the protocol loop, the in-memory store, and command
-groups. Effect is used at the entry point for service composition, while the hot
-path stays close to Bun's socket API.
-
-```text
-src/
-  index.ts          runtime entry point, environment config, optional worker fork
-  server.ts         Bun.listen TCP server, parse loop, per-connection async queue
-  connection.ts     connection state, write buffering, RESP2/RESP3 reply mode
-  resp.ts           RESP2/RESP3 parser and encoder, including a command fast path
-  store.ts          binary-safe in-memory store and data structures
-  pubsub.ts         channel and pattern subscriptions
-  server-context.ts shared store, pub/sub, config, connection set, key versions
-  commands/         command handlers grouped by Redis/Valkey family
-```
-
-A few details are worth calling out because they explain the shape of the code:
-
-- Values are stored as `Uint8Array` where possible, so protocol bytes are not
-  accidentally laundered through JavaScript strings.
-- JavaScript `Map` keys are strings, so arbitrary Redis keys use a latin1
-  bijection internally and round-trip back to bytes at the protocol boundary.
-- Expiry is checked lazily on reads and also swept once per second.
-- Each connection has a small async dispatch queue so a command with async work
-  does not reorder replies behind later commands on the same socket.
-- `WATCH` uses per-database key version counters, which is the simple version of
-  the idea and the right one for an in-memory local server.
-
-## Development
-
-```bash
-bun install
-bun test tests/
-bun run dev
-```
-
-There is also a benchmark driver:
-
-```bash
-bun run bench
-```
-
-By default it runs for a while and assumes a Linux-like `/proc` for process
-metrics, so treat it as a load tool rather than a universal CI step.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- No on-disk persistence (RDB/AOF); the server is intentionally ephemeral.
+- No replication or true cluster sharding (the cluster mode is process-level
+  `SO_REUSEPORT` with per-worker state).
+- `EVAL` Lua scripting returns an explicit "not supported" error; `SCRIPT`/
+  `FUNCTION` subcommands are stubbed for client compatibility.
+- HTTP/3 is experimental in Bun 1.3.x (per the release notes); WebSocket over
+  HTTP/3 and 0-RTT are not available. The admin endpoint transparently falls
+  back to HTTP/2 / HTTP/1.1 over TLS on the same port.
