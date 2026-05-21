@@ -153,6 +153,35 @@ GETRANGE k 0 4    # "Hello"
 GETRANGE k -5 -1  # "World"
 ```
 
+## LCS
+
+`LCS key1 key2 [LEN] [IDX] [MINMATCHLEN minmatchlen] [WITHMATCHLEN]` ·
+Arity ≥ 3
+
+Longest Common Subsequence of the **string** values at `key1` and `key2` (a
+missing key is treated as the empty string; a non-string value →
+`WRONGTYPE The specified keys must contain string values`).
+
+- Default: the LCS itself as a **bulk string**.
+- `LEN`: the length of the LCS as an **integer**.
+- `IDX`: a map `{ "matches": [...], "len": N }`. Each match is
+  `[[a-start, a-end], [b-start, b-end]]` (the contiguous run's index ranges
+  in `key1` and `key2`), with a trailing match length when `WITHMATCHLEN` is
+  given.
+- `MINMATCHLEN n`: only report `IDX` matches at least `n` long.
+- `LEN` and `IDX` together → `ERR If you want both the length and indexes,
+  please just use IDX.`
+
+**Reply:** bulk string (default), integer (`LEN`), or map (`IDX`).
+
+```bash
+MSET key1 ohmytext key2 mynewtext
+LCS key1 key2                       # "mytext"
+LCS key1 key2 LEN                   # (integer) 6
+LCS key1 key2 IDX MINMATCHLEN 4 WITHMATCHLEN
+# matches => [[[4,7],[5,8],4]], len => 6
+```
+
 ### TypeScript sample
 
 ```ts
@@ -163,5 +192,8 @@ await r.incr("page:1:views");
 await r.incrby("page:1:views", 9);          // 10
 await r.set("session:abc", "uid42", "EX", 3600);
 console.log(await r.getrange("session:abc", 0, 2)); // "uid"
+await r.mset("k1", "ohmytext", "k2", "mynewtext");
+console.log(await r.call("LCS", "k1", "k2"));       // "mytext"
+console.log(await r.call("LCS", "k1", "k2", "LEN")); // 6
 r.disconnect();
 ```

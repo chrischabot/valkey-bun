@@ -157,6 +157,62 @@ cardinality, optionally capped by `LIMIT` (`0` = no cap); any missing source →
 `ZSCAN key cursor [MATCH pattern] [COUNT n]` · Arity ≥ 3 → `[next-cursor,
 [member, score, ...]]` (numeric-offset cursor, step 10).
 
+## ZREMRANGEBYRANK / ZREMRANGEBYSCORE / ZREMRANGEBYLEX
+
+- `ZREMRANGEBYRANK key start stop` · Arity 4 — remove members in the inclusive
+  rank range (negatives count from the end).
+- `ZREMRANGEBYSCORE key min max` · Arity 4 — remove members in the
+  (inclusive/exclusive `(`) score range; `-inf`/`+inf` allowed.
+- `ZREMRANGEBYLEX key min max` · Arity 4 — remove members in the lex range
+  (`[m` inclusive, `(m` exclusive, `-`/`+` extremes).
+
+**Reply:** integer number of members removed. The zset is deleted when
+emptied.
+
+```bash
+ZADD z 1 a 2 b 3 c 4 d
+ZREMRANGEBYRANK z 0 1     # (integer) 2   (removed a,b)
+ZREMRANGEBYSCORE z 3 +inf # (integer) 1   (removed c, leaving d... )
+```
+
+## ZPOPMIN / ZPOPMAX (blocking: BZPOPMIN / BZPOPMAX)
+
+`BZPOPMIN key [key ...] timeout` · `BZPOPMAX key [key ...] timeout` ·
+Arity ≥ 3
+
+Blocking variants of `ZPOPMIN`/`ZPOPMAX`. Pop the lowest/highest-scored
+member of the first non-empty key, or **block** until a member is added to
+any of the keys or `timeout` seconds elapse (`0` = forever).
+Negative/invalid timeout → `ERR timeout is not a float or out of range`.
+
+**Reply:** 3-element array `[key, member, score]`, or `*-1` (null array) on
+timeout.
+
+```ts
+const p = c1.bzpopmin("board", 0);   // blocks
+await c2.zadd("board", 5, "x");
+console.log(await p);                 // ["board", "x", "5"]
+```
+
+## ZMPOP / BZMPOP
+
+`ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]` · Arity ≥ 4
+`BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]` · Arity ≥ 5
+
+Pop `COUNT` (default 1) lowest (`MIN`) or highest (`MAX`) scored members from
+the first non-empty zset among `numkeys` keys. `BZMPOP` blocks until data is
+available or `timeout` seconds elapse (`0` = forever). Bad arguments →
+`ERR numkeys should be greater than 0` / `ERR count should be greater than 0`
+/ `ERR syntax error`.
+
+**Reply:** `[key, [[member, score], ...]]`, or `*-1` (null array) when empty
+/ on timeout.
+
+```bash
+ZADD z 1 a 2 b 3 c
+ZMPOP 1 z MIN COUNT 2     # 1) "z" 2) 1) 1) "a" 2) "1"  2) 1) "b" 2) "2"
+```
+
 ### TypeScript sample
 
 ```ts
