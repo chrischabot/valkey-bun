@@ -1,16 +1,27 @@
 import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
-import { bytesToKey, type Database, type StoredValue } from "../store";
+import { bytesToKey, type Database } from "../store";
 
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 const enc = (s: string) => new TextEncoder().encode(s);
 
 function db(ctx: any, conn: any): Database { return ctx.store.db(conn.selectedDb); }
 
-function intOrErr(b: Uint8Array): number {
-  const s = dec(b);
-  const n = Number(s);
-  if (!Number.isInteger(n)) throw new Error("ERR value is not an integer or out of range");
+// Non-throwing strict integer parse. Returns null on invalid input so handlers
+// can emit a proper RESP error rather than throwing.
+function parseIntArg(b: Uint8Array): number | null {
+  const n = Number(dec(b));
+  return Number.isInteger(n) ? n : null;
+}
+
+// Parse a positive-integer expire argument at args[idx]; returns the number or
+// a RespValue error so SET/GETEX never throw on missing/invalid values.
+function expireArg(args: Uint8Array[], idx: number): number | RespValue {
+  if (idx >= args.length) return RESP.err("ERR syntax error");
+  const n = Number(dec(args[idx]!));
+  if (!Number.isInteger(n) || n <= 0) {
+    return RESP.err("ERR invalid expire time");
+  }
   return n;
 }
 
@@ -38,10 +49,30 @@ export const stringCommands: CommandSpec[] = [
       for (let i = 2; i < args.length; i++) {
         const opt = dec(args[i]!).toUpperCase();
         switch (opt) {
-          case "EX": expireAt = Date.now() + Number(dec(args[++i]!)) * 1000; break;
-          case "PX": expireAt = Date.now() + Number(dec(args[++i]!)); break;
-          case "EXAT": expireAt = Number(dec(args[++i]!)) * 1000; break;
-          case "PXAT": expireAt = Number(dec(args[++i]!)); break;
+          case "EX": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = Date.now() + r * 1000;
+            break;
+          }
+          case "PX": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = Date.now() + r;
+            break;
+          }
+          case "EXAT": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = r * 1000;
+            break;
+          }
+          case "PXAT": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = r;
+            break;
+          }
           case "KEEPTTL": keepTtl = true; break;
           case "NX": nx = true; break;
           case "XX": xx = true; break;
@@ -104,11 +135,32 @@ export const stringCommands: CommandSpec[] = [
       for (let i = 1; i < args.length; i++) {
         const opt = dec(args[i]!).toUpperCase();
         switch (opt) {
-          case "EX": expireAt = Date.now() + Number(dec(args[++i]!)) * 1000; break;
-          case "PX": expireAt = Date.now() + Number(dec(args[++i]!)); break;
-          case "EXAT": expireAt = Number(dec(args[++i]!)) * 1000; break;
-          case "PXAT": expireAt = Number(dec(args[++i]!)); break;
+          case "EX": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = Date.now() + r * 1000;
+            break;
+          }
+          case "PX": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = Date.now() + r;
+            break;
+          }
+          case "EXAT": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = r * 1000;
+            break;
+          }
+          case "PXAT": {
+            const r = expireArg(args, ++i);
+            if (typeof r !== "number") return r;
+            expireAt = r;
+            break;
+          }
           case "PERSIST": persist = true; break;
+          default: return RESP.err("ERR syntax error");
         }
       }
       if (persist) d.removeExpiry(key);
@@ -189,8 +241,24 @@ export const stringCommands: CommandSpec[] = [
   },
   { name: "INCR", arity: 2, handler: (ctx, conn, args) => incrBy(ctx, conn, args[0]!, 1) },
   { name: "DECR", arity: 2, handler: (ctx, conn, args) => incrBy(ctx, conn, args[0]!, -1) },
-  { name: "INCRBY", arity: 3, handler: (ctx, conn, args) => incrBy(ctx, conn, args[0]!, intOrErr(args[1]!)) },
-  { name: "DECRBY", arity: 3, handler: (ctx, conn, args) => incrBy(ctx, conn, args[0]!, -intOrErr(args[1]!)) },
+  {
+    name: "INCRBY",
+    arity: 3,
+    handler: (ctx, conn, args) => {
+      const delta = parseIntArg(args[1]!);
+      if (delta === null) return RESP.err("ERR value is not an integer or out of range");
+      return incrBy(ctx, conn, args[0]!, delta);
+    },
+  },
+  {
+    name: "DECRBY",
+    arity: 3,
+    handler: (ctx, conn, args) => {
+      const delta = parseIntArg(args[1]!);
+      if (delta === null) return RESP.err("ERR value is not an integer or out of range");
+      return incrBy(ctx, conn, args[0]!, -delta);
+    },
+  },
   {
     name: "INCRBYFLOAT",
     arity: 3,

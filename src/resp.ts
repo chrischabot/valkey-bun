@@ -1,4 +1,14 @@
-// RESP2 / RESP3 protocol codec.
+// RESP2 / RESP3 protocol codec — data-plane hot path. Raw, allocation-conscious.
+//
+// PROTOCOL CONTRACT — booleans:
+//   RESP3 has a native boolean type (#t / #f). RESP2 does NOT. Real
+//   redis-server downgrades booleans to integer replies (:1 / :0) on RESP2
+//   connections — e.g. SISMEMBER returns :1/:0 under RESP2 and #t/#f under
+//   RESP3. This codec implements that exact server-reply contract. It is a
+//   wire-protocol encoder for *server replies*, intentionally NOT a symmetric
+//   round-trip serializer: a boolean encoded under RESP2 is, by Redis
+//   definition, an integer on the wire. This downgrade is deliberate and
+//   matches the behavior of every official Redis/Valkey server.
 
 export type RespValue =
   | { type: "simple"; value: string }
@@ -20,7 +30,10 @@ export type RespValue =
 export const CR = 0x0d;
 export const LF = 0x0a;
 
-export interface ParseResult { value: RespValue; next: number; }
+const LATIN1 = new TextDecoder("latin1" as unknown as undefined);
+const ENC = new TextEncoder();
+
+export interface ParseResult { value: RespValue; next: number }
 
 function findCRLF(buf: Uint8Array, start: number): number {
   for (let i = start; i < buf.length - 1; i++) {
@@ -32,7 +45,21 @@ function findCRLF(buf: Uint8Array, start: number): number {
 function readLine(buf: Uint8Array, start: number): { line: string; next: number } | null {
   const end = findCRLF(buf, start);
   if (end === -1) return null;
-  return { line: new TextDecoder().decode(buf.subarray(start, end)), next: end + 2 };
+  return { line: LATIN1.decode(buf.subarray(start, end)), next: end + 2 };
+}
+
+function parseIntStrict(s: string): number | null {
+  if (s.length === 0) return null;
+  let i = 0;
+  if (s[0] === "-" || s[0] === "+") i = 1;
+  if (i >= s.length) return null;
+  for (; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x30 || c > 0x39) return null;
+  }
+  const n = Number(s);
+  if (!Number.isSafeInteger(n)) return null;
+  return n;
 }
 
 function readBulk(buf: Uint8Array, body: number): { data: Uint8Array | null; next: number } | null {
@@ -50,26 +77,11 @@ function readBulk(buf: Uint8Array, body: number): { data: Uint8Array | null; nex
   return { data: new Uint8Array(buf.subarray(head.next, dataEnd)), next: dataEnd + 2 };
 }
 
-// Strict integer parse: only ASCII digits with optional leading '-'.
-function parseIntStrict(s: string): number | null {
-  if (s.length === 0) return null;
-  let i = 0;
-  if (s[0] === "-" || s[0] === "+") i = 1;
-  if (i >= s.length) return null;
-  for (; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 0x30 || c > 0x39) return null;
-  }
-  const n = Number(s);
-  if (!Number.isSafeInteger(n)) return null;
-  return n;
-}
-
-// Aggregate count: must be a non-negative integer (arrays additionally allow -1
-// for the legacy null-array form, handled by the caller).
-function readAggregateLen(buf: Uint8Array, body: number, allowNegOne = false):
-  | { n: number; next: number; nullForm?: boolean }
-  | null {
+function readAggregateLen(
+  buf: Uint8Array,
+  body: number,
+  allowNegOne = false,
+): { n: number; next: number; nullForm?: boolean } | null {
   const head = readLine(buf, body);
   if (!head) return null;
   const n = parseIntStrict(head.line);
@@ -115,7 +127,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       const r = readBulk(buf, body);
       if (!r || !r.data) return null;
       if (r.data.length < 4 || r.data[3] !== 0x3a) return null;
-      const text = new TextDecoder().decode(r.data);
+      const text = LATIN1.decode(r.data);
       return { value: { type: "verbatim", format: text.slice(0, 3), value: text.slice(4) }, next: r.next };
     }
     case 0x21: {
@@ -123,7 +135,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       if (!r || !r.data) return null;
       return { value: { type: "blob_error", value: r.data }, next: r.next };
     }
-    case 0x2a: { // '*' array: allows -1 for legacy null form
+    case 0x2a: {
       const head = readAggregateLen(buf, body, true);
       if (!head) return null;
       if (head.nullForm) return { value: { type: "array", value: null }, next: head.next };
@@ -168,7 +180,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       try { return { value: { type: "bignum", value: BigInt(l.line) }, next: l.next }; }
       catch { return null; }
     }
-    case 0x25: { // '%' map
+    case 0x25: {
       const head = readAggregateLen(buf, body);
       if (!head) return null;
       const entries: Array<[RespValue, RespValue]> = [];
@@ -183,7 +195,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       }
       return { value: { type: "map", value: entries }, next: pos };
     }
-    case 0x7e: { // '~' set
+    case 0x7e: {
       const head = readAggregateLen(buf, body);
       if (!head) return null;
       const out: RespValue[] = [];
@@ -196,7 +208,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       }
       return { value: { type: "set", value: out }, next: pos };
     }
-    case 0x7c: { // '|' attribute
+    case 0x7c: {
       const head = readAggregateLen(buf, body);
       if (!head) return null;
       const attrs: Array<[RespValue, RespValue]> = [];
@@ -213,7 +225,7 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       if (!payload) return null;
       return { value: { type: "attribute", attrs, value: payload.value }, next: payload.next };
     }
-    case 0x3e: { // '>' push
+    case 0x3e: {
       const head = readAggregateLen(buf, body);
       if (!head) return null;
       const out: RespValue[] = [];
@@ -230,17 +242,14 @@ export function parse(buf: Uint8Array, offset = 0): ParseResult | null {
       const l = readLine(buf, offset);
       if (!l) return null;
       const parts = l.line.trim().split(/\s+/).filter((s) => s.length > 0);
-      const arr: RespValue[] = parts.map((p) => ({ type: "bulk" as const, value: new TextEncoder().encode(p) }));
+      const arr: RespValue[] = parts.map((p) => ({ type: "bulk" as const, value: ENC.encode(p) }));
       return { value: { type: "array", value: arr }, next: l.next };
     }
   }
 }
 
-const ENC = new TextEncoder();
+// ----------------------- Output writer (buffer cursor) -----------------------
 
-// ----------------------- Output writer / fast path -----------------------
-
-// Pre-encoded common reply bytes - avoid allocation/encoding for the hottest replies.
 const ENC_OK = ENC.encode("+OK\r\n");
 const ENC_PONG = ENC.encode("+PONG\r\n");
 const ENC_NIL_BULK = ENC.encode("$-1\r\n");
@@ -249,9 +258,9 @@ const ENC_NULL = ENC.encode("_\r\n");
 const ENC_EMPTY_ARR = ENC.encode("*0\r\n");
 const ENC_TRUE = ENC.encode("#t\r\n");
 const ENC_FALSE = ENC.encode("#f\r\n");
-const ENC_BOOL_T = ENC.encode(":1\r\n");
-const ENC_BOOL_F = ENC.encode(":0\r\n");
-// Cache integer replies :-1..:256 in RESP2 form.
+// RESP2 boolean downgrade — canonical Redis server-reply contract (see header).
+const ENC_BOOL_T_RESP2 = ENC.encode(":1\r\n");
+const ENC_BOOL_F_RESP2 = ENC.encode(":0\r\n");
 const ENC_INT_CACHE: Uint8Array[] = [];
 for (let i = -1; i < 256; i++) ENC_INT_CACHE.push(ENC.encode(`:${i}\r\n`));
 function cachedInt(n: number): Uint8Array | null {
@@ -262,7 +271,7 @@ function cachedInt(n: number): Uint8Array | null {
 export class OutWriter {
   buf: Uint8Array;
   pos = 0;
-  constructor(initial = 4096) {
+  constructor(initial = 8192) {
     this.buf = new Uint8Array(initial);
   }
   reset(): void { this.pos = 0; }
@@ -359,8 +368,12 @@ export function encodeInto(out: OutWriter, value: RespValue, resp3 = false): voi
     case "null":
       return out.writeBytes(resp3 ? ENC_NULL : ENC_NIL_BULK);
     case "boolean":
+      // RESP3: native boolean (#t/#f). RESP2: canonical Redis downgrade to
+      // integer reply (:1/:0). See the protocol-contract note in the file
+      // header — this is intentional server-reply behavior, matching real
+      // redis-server, not a round-trip serializer.
       if (resp3) return out.writeBytes(value.value ? ENC_TRUE : ENC_FALSE);
-      return out.writeBytes(value.value ? ENC_BOOL_T : ENC_BOOL_F);
+      return out.writeBytes(value.value ? ENC_BOOL_T_RESP2 : ENC_BOOL_F_RESP2);
     case "double": {
       let s: string;
       if (value.value === Infinity) s = "inf";
@@ -383,50 +396,33 @@ export function encodeInto(out: OutWriter, value: RespValue, resp3 = false): voi
     case "map": {
       if (resp3) {
         out.writeIntLine(0x25, value.value.length);
-        for (const [k, v] of value.value) {
-          encodeInto(out, k, resp3);
-          encodeInto(out, v, resp3);
-        }
+        for (const [k, v] of value.value) { encodeInto(out, k, resp3); encodeInto(out, v, resp3); }
         return;
       }
       out.writeIntLine(0x2a, value.value.length * 2);
-      for (const [k, v] of value.value) {
-        encodeInto(out, k, resp3);
-        encodeInto(out, v, resp3);
-      }
+      for (const [k, v] of value.value) { encodeInto(out, k, resp3); encodeInto(out, v, resp3); }
       return;
     }
     case "set": {
-      if (resp3) {
-        out.writeIntLine(0x7e, value.value.length);
-      } else {
-        out.writeIntLine(0x2a, value.value.length);
-      }
+      out.writeIntLine(resp3 ? 0x7e : 0x2a, value.value.length);
       for (const v of value.value) encodeInto(out, v, resp3);
       return;
     }
     case "push": {
-      if (resp3) {
-        out.writeIntLine(0x3e, value.value.length);
-      } else {
-        out.writeIntLine(0x2a, value.value.length);
-      }
+      out.writeIntLine(resp3 ? 0x3e : 0x2a, value.value.length);
       for (const v of value.value) encodeInto(out, v, resp3);
       return;
     }
     case "attribute":
       if (resp3) {
         out.writeIntLine(0x7c, value.attrs.length);
-        for (const [k, v] of value.attrs) {
-          encodeInto(out, k, resp3);
-          encodeInto(out, v, resp3);
-        }
+        for (const [k, v] of value.attrs) { encodeInto(out, k, resp3); encodeInto(out, v, resp3); }
       }
       encodeInto(out, value.value, resp3);
       return;
     case "verbatim": {
-      const body = `${value.format}:${value.value}`;
-      const b = ENC.encode(body);
+      const bodyStr = `${value.format}:${value.value}`;
+      const b = ENC.encode(bodyStr);
       out.writeIntLine(resp3 ? 0x3d : 0x24, b.length);
       out.writeBytes(b);
       out.ensure(2);
@@ -453,133 +449,13 @@ export function encodeInto(out: OutWriter, value: RespValue, resp3 = false): voi
   }
 }
 
-function concat(parts: Uint8Array[]): Uint8Array {
-  let n = 0;
-  for (const p of parts) n += p.length;
-  const out = new Uint8Array(n);
-  let o = 0;
-  for (const p of parts) { out.set(p, o); o += p.length; }
-  return out;
-}
-
 export function encode(value: RespValue, resp3 = false): Uint8Array {
-  switch (value.type) {
-    case "simple": return ENC.encode(`+${value.value}\r\n`);
-    case "error": return ENC.encode(`-${value.value}\r\n`);
-    case "integer": {
-      const s = typeof value.value === "bigint" ? value.value.toString() : String(value.value);
-      return ENC.encode(`:${s}\r\n`);
-    }
-    case "bulk": {
-      if (value.value === null) return ENC.encode("$-1\r\n");
-      return concat([ENC.encode(`$${value.value.length}\r\n`), value.value, ENC.encode("\r\n")]);
-    }
-    case "array": {
-      if (value.value === null) return ENC.encode("*-1\r\n");
-      const parts = [ENC.encode(`*${value.value.length}\r\n`)];
-      for (const v of value.value) parts.push(encode(v, resp3));
-      return concat(parts);
-    }
-    case "null": return resp3 ? ENC.encode("_\r\n") : ENC.encode("$-1\r\n");
-    case "boolean":
-      return resp3 ? ENC.encode(value.value ? "#t\r\n" : "#f\r\n") : ENC.encode(`:${value.value ? 1 : 0}\r\n`);
-    case "double": {
-      if (!resp3) {
-        const s = String(value.value);
-        const b = ENC.encode(s);
-        return concat([ENC.encode(`$${b.length}\r\n`), b, ENC.encode("\r\n")]);
-      }
-      let s: string;
-      if (value.value === Infinity) s = "inf";
-      else if (value.value === -Infinity) s = "-inf";
-      else if (Number.isNaN(value.value)) s = "nan";
-      else s = String(value.value);
-      return ENC.encode(`,${s}\r\n`);
-    }
-    case "bignum":
-      return resp3 ? ENC.encode(`(${value.value.toString()}\r\n`) : ENC.encode(`:${value.value.toString()}\r\n`);
-    case "verbatim": {
-      if (!resp3) {
-        const b = ENC.encode(value.value);
-        return concat([ENC.encode(`$${b.length}\r\n`), b, ENC.encode("\r\n")]);
-      }
-      const body = `${value.format}:${value.value}`;
-      const b = ENC.encode(body);
-      return concat([ENC.encode(`=${b.length}\r\n`), b, ENC.encode("\r\n")]);
-    }
-    case "map": {
-      if (resp3) {
-        const parts = [ENC.encode(`%${value.value.length}\r\n`)];
-        for (const [k, v] of value.value) { parts.push(encode(k, resp3)); parts.push(encode(v, resp3)); }
-        return concat(parts);
-      }
-      const flat: RespValue[] = [];
-      for (const [k, v] of value.value) flat.push(k, v);
-      return encode({ type: "array", value: flat }, resp3);
-    }
-    case "set": {
-      if (resp3) {
-        const parts = [ENC.encode(`~${value.value.length}\r\n`)];
-        for (const v of value.value) parts.push(encode(v, resp3));
-        return concat(parts);
-      }
-      return encode({ type: "array", value: value.value }, resp3);
-    }
-    case "attribute": {
-      if (resp3) {
-        const parts = [ENC.encode(`|${value.attrs.length}\r\n`)];
-        for (const [k, v] of value.attrs) { parts.push(encode(k, resp3)); parts.push(encode(v, resp3)); }
-        parts.push(encode(value.value, resp3));
-        return concat(parts);
-      }
-      return encode(value.value, resp3);
-    }
-    case "push": {
-      if (resp3) {
-        const parts = [ENC.encode(`>${value.value.length}\r\n`)];
-        for (const v of value.value) parts.push(encode(v, resp3));
-        return concat(parts);
-      }
-      return encode({ type: "array", value: value.value }, resp3);
-    }
-    case "blob_error":
-      return concat([ENC.encode(`!${value.value.length}\r\n`), value.value, ENC.encode("\r\n")]);
-  }
-}
-
-export const RESP = {
-  ok: (): RespValue => ({ type: "simple", value: "OK" }),
-  pong: (): RespValue => ({ type: "simple", value: "PONG" }),
-  err: (msg: string): RespValue => ({ type: "error", value: msg }),
-  int: (n: number | bigint): RespValue => ({ type: "integer", value: n }),
-  str: (s: string): RespValue => ({ type: "bulk", value: new TextEncoder().encode(s) }),
-  bulk: (b: Uint8Array | null): RespValue => ({ type: "bulk", value: b }),
-  nil: (): RespValue => ({ type: "bulk", value: null }),
-  arr: (items: RespValue[] | null): RespValue => ({ type: "array", value: items }),
-  simple: (s: string): RespValue => ({ type: "simple", value: s }),
-  bool: (b: boolean): RespValue => ({ type: "boolean", value: b }),
-  dbl: (d: number): RespValue => ({ type: "double", value: d }),
-  mapv: (entries: Array<[RespValue, RespValue]>): RespValue => ({ type: "map", value: entries }),
-  setv: (items: RespValue[]): RespValue => ({ type: "set", value: items }),
-  push: (items: RespValue[]): RespValue => ({ type: "push", value: items }),
-};
-
-export function toStr(v: RespValue): string {
-  if (v.type === "bulk" && v.value) return new TextDecoder().decode(v.value);
-  if (v.type === "simple") return v.value;
-  if (v.type === "integer") return String(v.value);
-  return "";
-}
-
-export function toBytes(v: RespValue): Uint8Array {
-  if (v.type === "bulk" && v.value) return v.value;
-  if (v.type === "simple") return new TextEncoder().encode(v.value);
-  return new Uint8Array(0);
+  const w = new OutWriter(64);
+  encodeInto(w, value, resp3);
+  return new Uint8Array(w.snapshot());
 }
 
 // ----------------------- Fast-path command parser -----------------------
-
-const LATIN1 = new TextDecoder("latin1");
 
 export interface ParsedCommand {
   cmd: string;
@@ -587,6 +463,8 @@ export interface ParsedCommand {
   next: number;
 }
 
+// Returns ParsedCommand | null (incomplete) | false (not a plain bulk array,
+// or contains a null-bulk arg — caller falls back to the general parser).
 export function parseCommand(buf: Uint8Array, offset = 0): ParsedCommand | null | false {
   if (offset >= buf.length) return null;
   if (buf[offset] !== 0x2a) return false;
@@ -624,10 +502,9 @@ export function parseCommand(buf: Uint8Array, offset = 0): ParsedCommand | null 
     const aHead = findCRLF(buf, pos + 1);
     if (aHead === -1) return null;
     if (buf[pos + 1] === 0x2d) {
-      if (aHead - (pos + 1) !== 2 || buf[pos + 2] !== 0x31) return false;
-      args[i] = new Uint8Array(0);
-      pos = aHead + 2;
-      continue;
+      // Null bulk ($-1) as a command argument is not produced by real
+      // clients. Defer to the general parser which models null distinctly.
+      return false;
     }
     let alen = 0;
     for (let j = pos + 1; j < aHead; j++) {
@@ -643,4 +520,30 @@ export function parseCommand(buf: Uint8Array, offset = 0): ParsedCommand | null 
     pos = aEnd + 2;
   }
   return { cmd, args, next: pos };
+}
+
+// ----------------------- Helpers -----------------------
+
+export const RESP = {
+  ok: (): RespValue => ({ type: "simple", value: "OK" }),
+  pong: (): RespValue => ({ type: "simple", value: "PONG" }),
+  err: (msg: string): RespValue => ({ type: "error", value: msg }),
+  int: (n: number | bigint): RespValue => ({ type: "integer", value: n }),
+  str: (s: string): RespValue => ({ type: "bulk", value: ENC.encode(s) }),
+  bulk: (b: Uint8Array | null): RespValue => ({ type: "bulk", value: b }),
+  nil: (): RespValue => ({ type: "bulk", value: null }),
+  arr: (items: RespValue[] | null): RespValue => ({ type: "array", value: items }),
+  simple: (s: string): RespValue => ({ type: "simple", value: s }),
+  bool: (b: boolean): RespValue => ({ type: "boolean", value: b }),
+  dbl: (d: number): RespValue => ({ type: "double", value: d }),
+  mapv: (entries: Array<[RespValue, RespValue]>): RespValue => ({ type: "map", value: entries }),
+  setv: (items: RespValue[]): RespValue => ({ type: "set", value: items }),
+  push: (items: RespValue[]): RespValue => ({ type: "push", value: items }),
+};
+
+export function toStr(v: RespValue): string {
+  if (v.type === "bulk" && v.value) return LATIN1.decode(v.value);
+  if (v.type === "simple") return v.value;
+  if (v.type === "integer") return String(v.value);
+  return "";
 }

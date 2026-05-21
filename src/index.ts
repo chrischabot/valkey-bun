@@ -1,59 +1,67 @@
-import { Context, Effect, Layer } from "effect";
-import { spawn } from "node:child_process";
-import { startServer } from "./server";
-import type { ServerConfig } from "./server-context";
+import { Effect, Layer } from "effect";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { ServerConfig, layer as configLayer } from "./config";
+import { startTcpServer } from "./tcp-server";
+import { startAdminServer } from "./admin";
 
-const CLUSTER_SIZE = Number(process.env.VALKEY_CLUSTER_SIZE ?? 1);
-
-if (CLUSTER_SIZE > 1 && !process.env.VALKEY_WORKER) {
-  // Master: fork N workers and exit.
-  const workers = [];
-  for (let i = 0; i < CLUSTER_SIZE; i++) {
-    const w = spawn(process.execPath, ["--bun", "run", new URL(import.meta.url).pathname], {
-      env: { ...process.env, VALKEY_WORKER: String(i) },
-      stdio: "inherit",
-    });
-    workers.push(w);
+// --- Multicore: master forks N reusePort workers, then exits with them. ---
+const clusterEnv = Number(process.env.VALKEY_CLUSTER_SIZE ?? 1);
+if (clusterEnv > 1 && !process.env.VALKEY_WORKER) {
+  const self = fileURLToPath(import.meta.url);
+  const workers: ChildProcess[] = [];
+  for (let i = 0; i < clusterEnv; i++) {
+    workers.push(
+      spawn(process.execPath, ["--bun", "run", self], {
+        env: { ...process.env, VALKEY_WORKER: String(i) },
+        stdio: "inherit",
+      }),
+    );
   }
-  process.on("SIGINT", () => { for (const w of workers) w.kill("SIGINT"); process.exit(0); });
-  process.on("SIGTERM", () => { for (const w of workers) w.kill("SIGTERM"); process.exit(0); });
-  // Keep master alive until all workers exit.
+  const killAll = (sig: NodeJS.Signals) => { for (const w of workers) w.kill(sig); process.exit(0); };
+  process.on("SIGINT", () => killAll("SIGINT"));
+  process.on("SIGTERM", () => killAll("SIGTERM"));
   let alive = workers.length;
   for (const w of workers) w.on("exit", () => { if (--alive === 0) process.exit(0); });
 } else {
-  // Worker (or single-process): start the listener.
-  class Config extends Context.Service<Config>()("Config") {
-    declare readonly value: ServerConfig & { reusePort?: boolean };
-  }
-
-  const ConfigLive = Layer.succeed(
-    Config,
-    { value: {
-      host: process.env.VALKEY_HOST ?? "0.0.0.0",
-      port: Number(process.env.VALKEY_PORT ?? 6379),
-      password: process.env.VALKEY_PASSWORD || null,
-      maxClients: Number(process.env.VALKEY_MAXCLIENTS ?? 10000),
-      dbCount: Number(process.env.VALKEY_DBCOUNT ?? 16),
-      reusePort: CLUSTER_SIZE > 1,
-    } } as any,
-  );
-
+  // --- Worker / single process: Effect-governed control plane. ---
   const program = Effect.gen(function* () {
-    const cfg = (yield* Config).value;
+    const { value: cfg } = yield* ServerConfig;
     const t0 = performance.now();
-    startServer(cfg);
+
+    const reusePort = clusterEnv > 1;
+    const { ctx } = startTcpServer({ ...cfg, reusePort });
+
+    const isAdminHost = process.env.VALKEY_WORKER === undefined
+      || process.env.VALKEY_WORKER === "0";
+    const admin = isAdminHost ? startAdminServer(ctx, cfg.adminPort) : null;
+
     const ms = (performance.now() - t0).toFixed(2);
     const role = process.env.VALKEY_WORKER !== undefined
       ? `worker ${process.env.VALKEY_WORKER}`
       : "single-process";
     yield* Effect.log(
-      `valkey-bun ${role} listening on ${cfg.host}:${cfg.port} (db=${cfg.dbCount}) ready in ${ms}ms`,
+      `valkey2 ${role} listening on ${cfg.host}:${cfg.port} ` +
+      `(db=${cfg.dbCount})` +
+      (isAdminHost ? ` admin http/3 (quic+h2+h1) on :${cfg.adminPort}` : " (admin: worker 0 only)") +
+      ` ready in ${ms}ms`,
     );
+
+    const shutdown = () => { try { admin?.stop(); } catch { /* ignore */ } process.exit(0); };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+
     yield* Effect.never;
   });
 
-  Effect.runPromise(Effect.provide(program, ConfigLive)).catch((e) => {
-    console.error("Fatal:", e);
+  // effect.solutions: provide the layer once at the top of the application.
+  const AppLayer = Layer.mergeAll(configLayer);
+
+  const runnable = Effect.provide(program, AppLayer) as Effect.Effect<void, unknown, never>;
+  Effect.runPromise(runnable).catch((e) => {
+    // ConfigError (Schema.TaggedError) and any defect surface here at the
+    // system boundary for diagnostics, then exit non-zero.
+    console.error("[valkey2] fatal:", e?.message ?? e);
     process.exit(1);
   });
 }

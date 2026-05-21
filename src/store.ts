@@ -1,24 +1,12 @@
-// Data store for valkey-bun.
-//
-// Binary-safe strategy: JavaScript Map keys must be strings. To preserve
-// arbitrary byte values (Redis/Valkey is binary-safe), we use the latin1
-// (ISO-8859-1) encoding which maps each byte 0..255 bijectively to
-// codepoints U+0000..U+00FF. Use `bytesToKey`/`keyToBytes` to convert.
-//
-// Value types:
-//   string -> Uint8Array
-//   list   -> Uint8Array[]
-//   hash   -> Map<string /*latin1 field*/, Uint8Array>
-//   set    -> Set<string /*latin1 member*/>   (binary-safe)
-//   zset   -> ZSet with latin1 member keys
-//   stream -> Stream
+// In-memory data store. Binary-safe via latin1 bijection (byte n <-> codepoint
+// n) so arbitrary bytes survive as Map keys. Data-plane: raw, no Effect here.
 
 export type ValueType = "string" | "list" | "hash" | "set" | "zset" | "stream" | "none";
 
-const LATIN1_DECODER = new TextDecoder("latin1");
+const LATIN1 = new TextDecoder("latin1" as unknown as undefined);
 
 export function bytesToKey(b: Uint8Array): string {
-  return LATIN1_DECODER.decode(b);
+  return LATIN1.decode(b);
 }
 
 export function keyToBytes(s: string): Uint8Array {
@@ -28,12 +16,14 @@ export function keyToBytes(s: string): Uint8Array {
 }
 
 export interface ZSetEntry {
-  member: string; // latin1-encoded binary-safe key
+  member: string;
   score: number;
 }
 
 export class ZSet {
   byMember = new Map<string, number>();
+  // Cached sorted entries; null = rebuild on next sortedEntries(). All writes
+  // must go through setScore()/remove() so the cache is invalidated.
   private _sorted: ZSetEntry[] | null = null;
 
   _invalidate(): void { this._sorted = null; }
@@ -93,6 +83,13 @@ export interface StreamEntry {
   fields: Array<[string, Uint8Array]>;
 }
 
+export interface StreamGroup {
+  name: string;
+  lastDelivered: string;
+  pending: Map<string, { consumer: string; deliveredAt: number; deliveries: number }>;
+  consumers: Map<string, { name: string; lastSeen: number; pending: number }>;
+}
+
 export class Stream {
   entries: StreamEntry[] = [];
   lastMs = 0;
@@ -131,23 +128,16 @@ export class Stream {
   }
 }
 
-export interface StreamGroup {
-  name: string;
-  lastDelivered: string;
-  pending: Map<string, { consumer: string; deliveredAt: number; deliveries: number }>;
-  consumers: Map<string, { name: string; lastSeen: number; pending: number }>;
-}
-
 export type StoredValue =
   | { type: "string"; value: Uint8Array }
   | { type: "list"; value: Uint8Array[] }
   | { type: "hash"; value: Map<string, Uint8Array> }
-  | { type: "set"; value: Set<string> } // members are latin1-encoded; convert with keyToBytes
+  | { type: "set"; value: Set<string> }
   | { type: "zset"; value: ZSet }
   | { type: "stream"; value: Stream };
 
 export class Database {
-  data = new Map<string, StoredValue>(); // keys are latin1-encoded
+  data = new Map<string, StoredValue>();
   expires = new Map<string, number>();
 
   clear(): void {
@@ -169,7 +159,7 @@ export class Database {
     return this.data.get(key);
   }
 
-  set(key: string, value: StoredValue, opts?: { keepTtl?: boolean; expireAt?: number }): void {
+  set(key: string, value: StoredValue, opts?: { keepTtl?: boolean | undefined; expireAt?: number | undefined }): void {
     this.data.set(key, value);
     if (opts?.expireAt !== undefined) {
       this.expires.set(key, opts.expireAt);
@@ -216,7 +206,7 @@ export class Database {
     return this.expires.delete(key);
   }
 
-  ttl(key: string): { kind: "none" | "no_expire" | "ms"; ms?: number } {
+  ttl(key: string): { kind: "none" | "no_expire" | "ms"; ms?: number | undefined } {
     if (!this.data.has(key)) return { kind: "none" };
     const exp = this.expires.get(key);
     if (exp === undefined) return { kind: "no_expire" };

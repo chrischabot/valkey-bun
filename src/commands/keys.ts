@@ -1,3 +1,8 @@
+// Arity convention: the dispatcher computes got = 1 + args.length and compares
+// to spec.arity, so arity counts the command name PLUS its arguments, while
+// the args array passed to handlers EXCLUDES the command name. e.g. for
+// `HSETNX key field value`, arity is 4 and args = [key, field, value].
+
 import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
 import { bytesToKey, keyToBytes, Stream, type Database, type StoredValue, type ValueType } from "../store";
@@ -56,6 +61,7 @@ export const keyCommands: CommandSpec[] = [
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       const seconds = Number(dec(args[1]!));
+      if (!Number.isFinite(seconds)) return RESP.err("ERR value is not an integer or out of range");
       if (!d.exists(k)) return RESP.int(0);
       d.setExpiry(k, Date.now() + seconds * 1000);
       ctx.bumpKey(conn.selectedDb, k);
@@ -69,6 +75,7 @@ export const keyCommands: CommandSpec[] = [
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       const ms = Number(dec(args[1]!));
+      if (!Number.isFinite(ms)) return RESP.err("ERR value is not an integer or out of range");
       if (!d.exists(k)) return RESP.int(0);
       d.setExpiry(k, Date.now() + ms);
       ctx.bumpKey(conn.selectedDb, k);
@@ -82,8 +89,10 @@ export const keyCommands: CommandSpec[] = [
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       const t = Number(dec(args[1]!));
+      if (!Number.isFinite(t)) return RESP.err("ERR value is not an integer or out of range");
       if (!d.exists(k)) return RESP.int(0);
       d.setExpiry(k, t * 1000);
+      ctx.bumpKey(conn.selectedDb, k);
       return RESP.int(1);
     },
   },
@@ -94,8 +103,10 @@ export const keyCommands: CommandSpec[] = [
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       const t = Number(dec(args[1]!));
+      if (!Number.isFinite(t)) return RESP.err("ERR value is not an integer or out of range");
       if (!d.exists(k)) return RESP.int(0);
       d.setExpiry(k, t);
+      ctx.bumpKey(conn.selectedDb, k);
       return RESP.int(1);
     },
   },
@@ -268,13 +279,13 @@ export const keyCommands: CommandSpec[] = [
         case "ENCODING": {
           const v = d.getRaw(bytesToKey(args[1]!));
           if (!v) return RESP.nil();
-          const enc = v.type === "string" ? "raw"
+          const e = v.type === "string" ? "raw"
             : v.type === "list" ? "listpack"
             : v.type === "hash" ? "listpack"
             : v.type === "set" ? "listpack"
             : v.type === "zset" ? "listpack"
             : "stream";
-          return RESP.str(enc);
+          return RESP.str(e);
         }
         case "REFCOUNT": return RESP.int(1);
         case "IDLETIME": return RESP.int(0);
@@ -309,8 +320,6 @@ export const keyCommands: CommandSpec[] = [
       if (!v) return RESP.int(0);
       const dd = ctx.store.db(destDb);
       if (!replace && dd.exists(dst)) return RESP.int(0);
-      // Propagate source TTL if any; otherwise explicitly clear any stale
-      // destination expiry so REPLACE never inherits residual TTL metadata.
       const srcExpiry = srcDb.expires.get(src);
       if (srcExpiry !== undefined) {
         dd.set(dst, deepCopy(v), { expireAt: srcExpiry });
@@ -330,6 +339,32 @@ export const keyCommands: CommandSpec[] = [
       let n = 0;
       for (const a of args) if (d.exists(bytesToKey(a))) n++;
       return RESP.int(n);
+    },
+  },
+  {
+    name: "MOVE",
+    arity: 3,
+    handler: (ctx, conn, args) => {
+      const dbIdx = Number(dec(args[1]!));
+      if (!Number.isInteger(dbIdx) || dbIdx < 0 || dbIdx >= ctx.store.dbs.length) {
+        return RESP.err("ERR DB index is out of range");
+      }
+      if (dbIdx === conn.selectedDb) return RESP.err("ERR source and destination objects are the same");
+      const src = ctx.store.db(conn.selectedDb);
+      const dst = ctx.store.db(dbIdx);
+      const key = bytesToKey(args[0]!);
+      const v = src.getRaw(key);
+      if (!v) return RESP.int(0);
+      if (dst.exists(key)) return RESP.int(0);
+      // Deep-copy into the destination DB and carry over any source TTL so the
+      // two DBs never share mutable backing for complex types.
+      const srcExpiry = src.expires.get(key);
+      if (srcExpiry !== undefined) dst.set(key, deepCopy(v), { expireAt: srcExpiry });
+      else dst.set(key, deepCopy(v));
+      src.delete(key);
+      ctx.bumpKey(conn.selectedDb, key);
+      ctx.bumpKey(dbIdx, key);
+      return RESP.int(1);
     },
   },
 ];

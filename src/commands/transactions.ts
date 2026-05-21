@@ -4,7 +4,7 @@ import { RESP, type RespValue } from "../resp";
 import { bytesToKey } from "../store";
 
 let registryRef: Registry | null = null;
-export function setTransactionRegistry(r: Registry) { registryRef = r; }
+export function setTransactionRegistry(r: Registry): void { registryRef = r; }
 
 export const transactionCommands: CommandSpec[] = [
   {
@@ -38,14 +38,10 @@ export const transactionCommands: CommandSpec[] = [
     noQueue: true,
     handler: async (ctx, conn) => {
       if (!conn.inMulti) return RESP.err("ERR EXEC without MULTI");
-      // Check WATCH versions.
       let aborted = false;
       for (const [dbIdx, watched] of conn.watched) {
         for (const [key, version] of watched) {
-          if (ctx.keyVersion(dbIdx, key) !== version) {
-            aborted = true;
-            break;
-          }
+          if (ctx.keyVersion(dbIdx, key) !== version) { aborted = true; break; }
         }
         if (aborted) break;
       }
@@ -58,7 +54,6 @@ export const transactionCommands: CommandSpec[] = [
       if (hadError) return RESP.err("EXECABORT Transaction discarded because of previous errors.");
       if (aborted) return RESP.arr(null);
       if (!registryRef) return RESP.err("ERR registry not initialized");
-      // Capture replies during execution.
       const captured: RespValue[] = [];
       const origReply = conn.reply.bind(conn);
       conn.reply = (v: RespValue) => { captured.push(v); };

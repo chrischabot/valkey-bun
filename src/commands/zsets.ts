@@ -31,6 +31,11 @@ function fmtScore(n: number): string {
   return n.toString();
 }
 
+function scoreReply(conn: any, n: number): RespValue {
+  if (conn.resp3) return RESP.dbl(n);
+  return { type: "bulk", value: new TextEncoder().encode(fmtScore(n)) };
+}
+
 function parseScore(s: string): number {
   if (s === "+inf" || s === "inf") return Infinity;
   if (s === "-inf") return -Infinity;
@@ -71,11 +76,6 @@ function inLexRange(member: string, minS: string, maxS: string): boolean {
   return true;
 }
 
-function scoreReply(conn: any, n: number) {
-  if (conn.resp3) return RESP.dbl(n);
-  return { type: "bulk" as const, value: new TextEncoder().encode(fmtScore(n)) };
-}
-
 export const zsetCommands: CommandSpec[] = [
   {
     name: "ZADD",
@@ -97,8 +97,13 @@ export const zsetCommands: CommandSpec[] = [
       }
       const pairs = args.slice(i);
       if (pairs.length === 0 || pairs.length % 2 !== 0) return RESP.err("ERR syntax error");
+      if (incr && pairs.length !== 2) {
+        return RESP.err("ERR INCR option supports a single increment-element pair");
+      }
       const z = getOrCreateZSet(d, k);
+      const existed = z.size() > 0;
       let added = 0, changed = 0, lastScore = 0;
+      let incrApplied = false;
       for (let p = 0; p < pairs.length; p += 2) {
         const score = parseScore(dec(pairs[p]!));
         const member = bytesToKey(pairs[p + 1]!);
@@ -114,10 +119,12 @@ export const zsetCommands: CommandSpec[] = [
         else if (cur !== newScore) changed++;
         z.setScore(member, newScore);
         lastScore = newScore;
+        incrApplied = true;
       }
-      ctx.bumpKey(conn.selectedDb, k);
-      if (z.size() === 0) d.delete(k);
-      if (incr) return scoreReply(conn, lastScore);
+      const mutated = added > 0 || changed > 0;
+      if (mutated) ctx.bumpKey(conn.selectedDb, k);
+      if (z.size() === 0 && !existed) d.delete(k);
+      if (incr) return incrApplied ? scoreReply(conn, lastScore) : RESP.nil();
       return RESP.int(ch ? added + changed : added);
     },
   },
@@ -132,7 +139,7 @@ export const zsetCommands: CommandSpec[] = [
       let n = 0;
       for (let i = 1; i < args.length; i++) if (z.remove(bytesToKey(args[i]!))) n++;
       if (z.size() === 0) d.delete(k);
-      ctx.bumpKey(conn.selectedDb, k);
+      if (n > 0) ctx.bumpKey(conn.selectedDb, k);
       return RESP.int(n);
     },
   },
@@ -211,7 +218,7 @@ export const zsetCommands: CommandSpec[] = [
       if (rank === null) return withScore ? RESP.arr(null) : RESP.nil();
       if (withScore) {
         const s = z.score(bytesToKey(args[1]!))!;
-        return RESP.arr([RESP.int(rank), { type: "bulk", value: new TextEncoder().encode(fmtScore(s)) }]);
+        return RESP.arr([RESP.int(rank), scoreReply(conn, s)]);
       }
       return RESP.int(rank);
     },
@@ -227,7 +234,7 @@ export const zsetCommands: CommandSpec[] = [
       if (rank === null) return withScore ? RESP.arr(null) : RESP.nil();
       if (withScore) {
         const s = z.score(bytesToKey(args[1]!))!;
-        return RESP.arr([RESP.int(rank), { type: "bulk", value: new TextEncoder().encode(fmtScore(s)) }]);
+        return RESP.arr([RESP.int(rank), scoreReply(conn, s)]);
       }
       return RESP.int(rank);
     },
@@ -276,11 +283,16 @@ export const zsetCommands: CommandSpec[] = [
     name: "ZRANGESTORE",
     arity: -5,
     handler: (ctx, conn, args) => {
-      // ZRANGESTORE dst src min max [BYSCORE|BYLEX] [REV] [LIMIT off cnt]
       const d = db(ctx, conn);
       const dst = bytesToKey(args[0]!);
       const z = getZSet(d, bytesToKey(args[1]!));
-      if (!z) { d.delete(dst); return RESP.int(0); }
+      if (!z) {
+        // Source missing: deleting the destination is a write — bump its
+        // version consistently with all other ZRANGESTORE write paths.
+        d.delete(dst);
+        ctx.bumpKey(conn.selectedDb, dst);
+        return RESP.int(0);
+      }
       const startS = dec(args[2]!);
       const stopS = dec(args[3]!);
       let byScore = false, byLex = false, rev = false;
@@ -296,7 +308,7 @@ export const zsetCommands: CommandSpec[] = [
         }
       }
       let entries = z.sortedEntries();
-      if (rev) entries = entries.reverse();
+      if (rev) entries = entries.slice().reverse();
       if (byScore) {
         const r = rev ? parseScoreRange(stopS, startS) : parseScoreRange(startS, stopS);
         entries = entries.filter((e) => inScoreRange(e.score, r));
@@ -371,7 +383,7 @@ function zrangeRev(ctx: any, conn: any, args: Uint8Array[]): RespValue {
   const start = Number(dec(args[1]!));
   const stop = Number(dec(args[2]!));
   const withScores = args.length > 3 && dec(args[3]!).toUpperCase() === "WITHSCORES";
-  const entries = z.sortedEntries().reverse();
+  const entries = z.sortedEntries().slice().reverse();
   return sliceAndEmit(entries, start, stop, withScores);
 }
 
@@ -394,7 +406,7 @@ function zrange(ctx: any, conn: any, args: Uint8Array[]): RespValue {
     }
   }
   let entries = z.sortedEntries();
-  if (rev) entries = entries.reverse();
+  if (rev) entries = entries.slice().reverse();
   if (byScore) {
     const r = rev ? parseScoreRange(stopS, startS) : parseScoreRange(startS, stopS);
     entries = entries.filter((e) => inScoreRange(e.score, r));
@@ -426,7 +438,7 @@ function zrangeByScore(ctx: any, conn: any, args: Uint8Array[], rev: boolean): R
     }
   }
   let entries = z.sortedEntries().filter((e) => inScoreRange(e.score, r));
-  if (rev) entries.reverse();
+  if (rev) entries = entries.slice().reverse();
   if (limitCount >= 0 || limitOffset > 0) {
     entries = entries.slice(limitOffset, limitCount < 0 ? undefined : limitOffset + limitCount);
   }
@@ -447,7 +459,7 @@ function zrangeByLex(ctx: any, conn: any, args: Uint8Array[], rev: boolean): Res
     }
   }
   let entries = z.sortedEntries().filter((e) => inLexRange(e.member, lo, hi));
-  if (rev) entries.reverse();
+  if (rev) entries = entries.slice().reverse();
   if (limitCount >= 0 || limitOffset > 0) {
     entries = entries.slice(limitOffset, limitCount < 0 ? undefined : limitOffset + limitCount);
   }
@@ -479,11 +491,11 @@ function zpop(ctx: any, conn: any, args: Uint8Array[], reverse: boolean): RespVa
   if (!z || z.size() === 0) return RESP.arr([]);
   const count = args.length > 1 ? Number(dec(args[1]!)) : 1;
   let entries = z.sortedEntries();
-  if (reverse) entries = entries.reverse();
+  if (reverse) entries = entries.slice().reverse();
   const picked = entries.slice(0, count);
   for (const e of picked) z.remove(e.member);
   if (z.size() === 0) d.delete(k);
-  ctx.bumpKey(conn.selectedDb, k);
+  if (picked.length > 0) ctx.bumpKey(conn.selectedDb, k);
   const out: RespValue[] = [];
   for (const e of picked) {
     out.push({ type: "bulk", value: keyToBytes(e.member) });

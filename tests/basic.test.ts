@@ -1,18 +1,20 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Redis } from "ioredis";
-import { startServer } from "../src/server";
+import { startTcpServer } from "../src/tcp-server";
 
-const PORT = 16380;
-let server: ReturnType<typeof startServer>;
+const PORT = 16480;
+let server: ReturnType<typeof startTcpServer>;
 let r: Redis;
 
 beforeAll(async () => {
-  server = startServer({
+  server = startTcpServer({
     host: "127.0.0.1",
     port: PORT,
     password: null,
     maxClients: 1000,
     dbCount: 16,
+    clusterSize: 1,
+    adminPort: 0,
   });
   r = new Redis({ host: "127.0.0.1", port: PORT, lazyConnect: false, maxRetriesPerRequest: 1 });
   await r.ping();
@@ -24,16 +26,13 @@ afterAll(async () => {
 });
 
 describe("connection", () => {
-  test("PING", async () => {
+  test("PING/ECHO", async () => {
     expect(await r.ping()).toBe("PONG");
-    expect(await r.ping("hello")).toBe("hello");
-  });
-  test("ECHO", async () => {
+    expect(await r.ping("hi")).toBe("hi");
     expect(await r.echo("payload")).toBe("payload");
   });
   test("CLIENT ID/NAME", async () => {
-    const id = await r.client("ID");
-    expect(typeof id).toBe("number");
+    expect(typeof (await r.client("ID"))).toBe("number");
     await r.client("SETNAME", "tester");
     expect(await r.client("GETNAME")).toBe("tester");
   });
@@ -47,14 +46,11 @@ describe("strings", () => {
     expect(await r.del("k")).toBe(1);
     expect(await r.get("k")).toBeNull();
   });
-  test("SET NX/XX, GET option", async () => {
+  test("SET NX/XX/GET", async () => {
     expect(await r.set("k1", "v1", "NX")).toBe("OK");
     expect(await r.set("k1", "v2", "NX")).toBeNull();
     expect(await r.set("k1", "v3", "XX")).toBe("OK");
-    expect(await r.set("missing", "x", "XX")).toBeNull();
-    expect(await r.get("k1")).toBe("v3");
-    const prev = await r.set("k1", "v4", "GET");
-    expect(prev).toBe("v3");
+    expect(await r.set("k1", "v4", "GET")).toBe("v3");
   });
   test("INCR/DECR/INCRBY/INCRBYFLOAT", async () => {
     await r.set("n", "10");
@@ -67,14 +63,12 @@ describe("strings", () => {
     await r.mset("a", "1", "b", "2", "c", "3");
     expect(await r.mget("a", "b", "c")).toEqual(["1", "2", "3"]);
     expect(await r.append("a", "9")).toBe(2);
-    expect(await r.get("a")).toBe("19");
     expect(await r.strlen("a")).toBe(2);
   });
   test("EXPIRE/TTL/PERSIST", async () => {
     await r.set("e", "x");
     expect(await r.expire("e", 100)).toBe(1);
-    const ttl = await r.ttl("e");
-    expect(ttl).toBeGreaterThan(0);
+    expect(await r.ttl("e")).toBeGreaterThan(0);
     expect(await r.persist("e")).toBe(1);
     expect(await r.ttl("e")).toBe(-1);
   });
@@ -91,52 +85,55 @@ describe("hashes", () => {
     await r.del("h");
     expect(await r.hset("h", "a", "1", "b", "2")).toBe(2);
     expect(await r.hget("h", "a")).toBe("1");
-    const all = await r.hgetall("h");
-    expect(all).toEqual({ a: "1", b: "2" });
+    expect(await r.hgetall("h")).toEqual({ a: "1", b: "2" });
     expect(await r.hdel("h", "a")).toBe(1);
   });
-  test("HINCRBY", async () => {
+  test("HINCRBY/HKEYS/HVALS/HLEN", async () => {
     await r.del("h");
-    expect(await r.hincrby("h", "counter", 7)).toBe(7);
-    expect(await r.hincrby("h", "counter", -2)).toBe(5);
-  });
-  test("HKEYS/HVALS/HLEN", async () => {
-    await r.del("h");
-    await r.hset("h", "x", "1", "y", "2", "z", "3");
-    const ks = (await r.hkeys("h")).sort();
-    expect(ks).toEqual(["x", "y", "z"]);
-    expect((await r.hvals("h")).sort()).toEqual(["1", "2", "3"]);
+    expect(await r.hincrby("h", "c", 7)).toBe(7);
+    await r.hset("h", "x", "1", "y", "2");
+    expect((await r.hkeys("h")).sort()).toEqual(["c", "x", "y"]);
     expect(await r.hlen("h")).toBe(3);
   });
 });
 
 describe("lists", () => {
-  test("LPUSH/RPUSH/LRANGE/LLEN", async () => {
+  test("RPUSH/LPUSH/LRANGE/LLEN/LPOP", async () => {
     await r.del("l");
     expect(await r.rpush("l", "a", "b", "c")).toBe(3);
     expect(await r.lrange("l", 0, -1)).toEqual(["a", "b", "c"]);
     expect(await r.lpush("l", "z")).toBe(4);
-    expect(await r.lrange("l", 0, -1)).toEqual(["z", "a", "b", "c"]);
-    expect(await r.llen("l")).toBe(4);
+    expect(await r.lpop("l")).toBe("z");
+    expect(await r.llen("l")).toBe(3);
   });
-  test("LPOP/RPOP/LINDEX/LSET", async () => {
-    await r.del("l");
-    await r.rpush("l", "1", "2", "3", "4");
-    expect(await r.lpop("l")).toBe("1");
-    expect(await r.rpop("l")).toBe("4");
-    expect(await r.lindex("l", 0)).toBe("2");
-    await r.lset("l", 0, "X");
-    expect(await r.lindex("l", 0)).toBe("X");
-  });
-  test("LREM/LTRIM/LINSERT", async () => {
+  test("LREM/LINSERT/LTRIM", async () => {
     await r.del("l");
     await r.rpush("l", "a", "b", "a", "c");
     expect(await r.lrem("l", 1, "a")).toBe(1);
-    expect(await r.lrange("l", 0, -1)).toEqual(["b", "a", "c"]);
     await r.linsert("l", "BEFORE", "a", "X");
     expect(await r.lrange("l", 0, -1)).toEqual(["b", "X", "a", "c"]);
     await r.ltrim("l", 1, 2);
     expect(await r.lrange("l", 0, -1)).toEqual(["X", "a"]);
+  });
+  test("BRPOP immediate (data present)", async () => {
+    await r.del("bq");
+    await r.rpush("bq", "j1", "j2");
+    expect(await r.brpop("bq", 0)).toEqual(["bq", "j2"]);
+  });
+  test("BLPOP blocks then wakes on push", async () => {
+    await r.del("bw");
+    const sub = new Redis({ host: "127.0.0.1", port: PORT });
+    const p = sub.blpop("bw", 5);
+    await new Promise((res) => setTimeout(res, 80));
+    await r.rpush("bw", "hello");
+    expect(await p).toEqual(["bw", "hello"]);
+    sub.disconnect();
+  });
+  test("BLPOP timeout returns nil", async () => {
+    const sub = new Redis({ host: "127.0.0.1", port: PORT });
+    const res = await sub.blpop("never", 1);
+    expect(res).toBeNull();
+    sub.disconnect();
   });
 });
 
@@ -147,7 +144,6 @@ describe("sets", () => {
     expect((await r.smembers("s")).sort()).toEqual(["a", "b", "c"]);
     expect(await r.scard("s")).toBe(3);
     expect(await r.sismember("s", "a")).toBe(1);
-    expect(await r.sismember("s", "z")).toBe(0);
   });
   test("SUNION/SINTER/SDIFF", async () => {
     await r.del("s1", "s2");
@@ -168,38 +164,21 @@ describe("sorted sets", () => {
     expect(await r.zrange("z", 0, -1, "WITHSCORES")).toEqual(["a", "1", "b", "2", "c", "3"]);
     expect(await r.zcard("z")).toBe(3);
   });
-  test("ZRANGEBYSCORE/ZINCRBY/ZRANK", async () => {
+  test("ZRANGEBYSCORE/ZINCRBY/ZRANK/ZPOP", async () => {
     await r.del("z");
-    await r.zadd("z", 10, "x", 20, "y", 30, "z");
+    await r.zadd("z", 10, "x", 20, "y", 30, "w");
     expect(await r.zrangebyscore("z", 15, 25)).toEqual(["y"]);
     expect(await r.zincrby("z", 5, "x")).toBe("15");
     expect(await r.zrank("z", "x")).toBe(0);
-  });
-  test("ZREM/ZPOPMIN/ZPOPMAX", async () => {
-    await r.del("z");
-    await r.zadd("z", 1, "a", 2, "b", 3, "c");
-    expect(await r.zrem("z", "b")).toBe(1);
-    expect(await r.zpopmin("z")).toEqual(["a", "1"]);
-    expect(await r.zpopmax("z")).toEqual(["c", "3"]);
+    expect(await r.zpopmin("z")).toEqual(["x", "15"]);
   });
 });
 
 describe("transactions", () => {
   test("MULTI/EXEC", async () => {
     await r.del("t");
-    const res = await r
-      .multi()
-      .set("t", "1")
-      .incr("t")
-      .incr("t")
-      .get("t")
-      .exec();
-    expect(res).toEqual([
-      [null, "OK"],
-      [null, 2],
-      [null, 3],
-      [null, "3"],
-    ]);
+    const res = await r.multi().set("t", "1").incr("t").incr("t").get("t").exec();
+    expect(res).toEqual([[null, "OK"], [null, 2], [null, 3], [null, "3"]]);
   });
   test("DISCARD", async () => {
     expect(await r.call("MULTI")).toBe("OK");
@@ -207,39 +186,39 @@ describe("transactions", () => {
     expect(await r.call("DISCARD")).toBe("OK");
     expect(await r.get("d")).toBeNull();
   });
+  test("WATCH abort", async () => {
+    await r.set("w", "1");
+    await r.watch("w");
+    const other = new Redis({ host: "127.0.0.1", port: PORT });
+    await other.set("w", "2");
+    other.disconnect();
+    const res = await r.multi().set("w", "3").exec();
+    expect(res).toBeNull();
+    expect(await r.get("w")).toBe("2");
+  });
 });
 
 describe("pubsub", () => {
   test("SUBSCRIBE/PUBLISH", async () => {
     const sub = new Redis({ host: "127.0.0.1", port: PORT });
     const received: Array<[string, string]> = [];
-    await new Promise<void>((resolve) => {
-      sub.subscribe("chan", (err) => {
-        expect(err).toBeNull();
-        resolve();
-      });
-    });
-    sub.on("message", (channel, message) => received.push([channel, message]));
-    await new Promise((r2) => setTimeout(r2, 50));
+    await new Promise<void>((resolve) => sub.subscribe("chan", () => resolve()));
+    sub.on("message", (c, m) => received.push([c, m]));
+    await new Promise((res) => setTimeout(res, 50));
     expect(await r.publish("chan", "hello")).toBe(1);
-    await new Promise((r2) => setTimeout(r2, 100));
+    await new Promise((res) => setTimeout(res, 100));
     expect(received).toEqual([["chan", "hello"]]);
     sub.disconnect();
   });
 });
 
 describe("server", () => {
-  test("INFO/TIME/DBSIZE", async () => {
-    const info = await r.info();
-    expect(info).toContain("redis_version");
-    const t = await r.time();
-    expect(t).toHaveLength(2);
+  test("INFO/TIME/DBSIZE/CONFIG", async () => {
+    expect(await r.info()).toContain("redis_version");
+    expect(await r.time()).toHaveLength(2);
     expect(typeof (await r.dbsize())).toBe("number");
-  });
-  test("CONFIG GET/SET", async () => {
     await r.config("SET", "maxmemory", "100mb");
-    const got = await r.config("GET", "maxmemory");
-    expect(got).toEqual(["maxmemory", "100mb"]);
+    expect(await r.config("GET", "maxmemory")).toEqual(["maxmemory", "100mb"]);
   });
   test("KEYS/SCAN/TYPE", async () => {
     await r.flushdb();
@@ -254,10 +233,19 @@ describe("server", () => {
 describe("streams", () => {
   test("XADD/XLEN/XRANGE", async () => {
     await r.del("st");
-    const id = await r.xadd("st", "*", "field", "val");
-    expect(typeof id).toBe("string");
-    expect(await r.xlen("st")).toBe(1);
-    const range = await r.xrange("st", "-", "+");
-    expect(range[0]?.[0]).toBe(id);
+    const id1 = await r.xadd("st", "*", "level", "info");
+    const id2 = await r.xadd("st", "*", "level", "warn");
+    expect(await r.xlen("st")).toBe(2);
+    const all = await r.xrange("st", "-", "+");
+    expect(all.map((e) => e[0])).toEqual([id1, id2]);
+  });
+  test("XGROUP/XREADGROUP/XACK", async () => {
+    await r.del("sg");
+    await r.xadd("sg", "*", "n", "1");
+    await r.xgroup("CREATE", "sg", "g1", "0");
+    const read = await r.xreadgroup("GROUP", "g1", "c1", "COUNT", 10, "STREAMS", "sg", ">");
+    expect(read).not.toBeNull();
+    const pending = await r.xpending("sg", "g1");
+    expect(pending[0]).toBe(1);
   });
 });

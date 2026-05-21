@@ -24,8 +24,7 @@ export class Connection {
   subscribedPatterns = new Set<string>();
   closed = false;
 
-  // Per-connection write buffer. Replies accumulate here and flush() emits a
-  // single socket.write() at the end of each data() drain.
+  // Per-connection write buffer. flush() emits one socket.write() per drain.
   out = new OutWriter(8192);
 
   constructor(socket: Socket<unknown>) {
@@ -72,13 +71,8 @@ export class Connection {
   }
 
   sendMessage(channel: string, message: Uint8Array): void {
-    const items: RespValue[] = [
-      RESP.str("message"),
-      RESP.str(channel),
-      RESP.bulk(message),
-    ];
+    const items: RespValue[] = [RESP.str("message"), RESP.str(channel), RESP.bulk(message)];
     this.reply(this.resp3 ? { type: "push", value: items } : { type: "array", value: items });
-    // Pub/sub messages must go out promptly for subscribers waiting on data.
     this.flush();
   }
 

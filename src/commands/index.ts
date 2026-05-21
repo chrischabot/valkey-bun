@@ -22,7 +22,7 @@ export type CommandHandler = (
 
 export interface CommandSpec {
   name: string;
-  arity: number;
+  arity: number; // counts command name + args; negative => "at least |n|"
   handler: CommandHandler;
   noQueue?: boolean;
   subscribeOk?: boolean;
@@ -41,7 +41,9 @@ export class Registry {
     if (direct) return direct;
     return this.map.get(name.toUpperCase());
   }
-  list(): CommandSpec[] { return Array.from(new Set(this.map.values())); }
+  list(): CommandSpec[] {
+    return Array.from(new Set(this.map.values()));
+  }
 }
 
 export function buildRegistry(): Registry {
@@ -60,7 +62,6 @@ const SUBSCRIBE_ALLOWED = new Set([
   "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
   "SSUBSCRIBE", "SUNSUBSCRIBE", "PING", "QUIT", "RESET",
 ]);
-
 const AUTH_ALLOWED = new Set(["AUTH", "HELLO", "QUIT", "PING"]);
 
 function preDispatch(
@@ -78,12 +79,10 @@ function preDispatch(
     conn.reply(RESP.err("NOAUTH Authentication required."));
     return null;
   }
-
   if (!spec) {
     conn.reply(RESP.err(`ERR unknown command '${name.toLowerCase()}'`));
     return null;
   }
-
   const want = spec.arity;
   const got = 1 + args.length;
   if (want >= 0 ? got !== want : got < -want) {
@@ -91,7 +90,6 @@ function preDispatch(
     if (conn.inMulti) conn.multiError = true;
     return null;
   }
-
   if (conn.inSubscribeMode() && !SUBSCRIBE_ALLOWED.has(getUpper())) {
     conn.reply(
       RESP.err(
@@ -100,25 +98,29 @@ function preDispatch(
     );
     return null;
   }
-
   if (conn.inMulti && !spec.noQueue) {
     conn.multiQueue.push({ name: getUpper(), args });
     conn.reply(RESP.simple("QUEUED"));
     return null;
   }
-
   return spec;
 }
 
 function handleErr(conn: Connection, e: any): void {
   const msg = e?.message ?? String(e);
-  conn.reply(RESP.err(msg.startsWith("ERR ") || msg.startsWith("WRONGTYPE") || msg.startsWith("NOAUTH") ? msg : `ERR ${msg}`));
+  conn.reply(
+    RESP.err(
+      msg.startsWith("ERR ") || msg.startsWith("WRONGTYPE") || msg.startsWith("NOAUTH")
+        ? msg
+        : `ERR ${msg}`,
+    ),
+  );
   if (conn.inMulti) conn.multiError = true;
 }
 
-// Synchronous fast path. Caller MUST ensure no prior async work pending for
-// this connection (server.ts checks queues.has(conn) before invoking).
-// Returns a Promise iff handler returned a thenable; null otherwise.
+// Synchronous fast path. Caller must ensure no prior async work is pending for
+// this connection (the server loop guards via a per-conn queue). Returns a
+// Promise iff the handler returned a thenable; otherwise null.
 export function dispatchSync(
   ctx: ServerContext,
   conn: Connection,
@@ -128,7 +130,7 @@ export function dispatchSync(
 ): Promise<unknown> | null {
   const spec = preDispatch(ctx, conn, registry, name, args);
   if (!spec) return null;
-
+  ctx.totalCommands++;
   let out: any;
   try {
     out = spec.handler(ctx, conn, args);
@@ -136,21 +138,17 @@ export function dispatchSync(
     handleErr(conn, e);
     return null;
   }
-
   if (out && typeof out.then === "function") {
     return (out as Promise<RespValue | undefined>).then(
       (v) => { if (v !== undefined && v !== null) conn.reply(v); },
       (e: any) => handleErr(conn, e),
     );
   }
-
   if (out !== undefined && out !== null) conn.reply(out as RespValue);
   return null;
 }
 
-// Full async dispatch (used by EXEC and the per-conn deferred queue). Always
-// returns a Promise. Wrap with `() => dispatch(...)` when you need to defer
-// execution itself, not just settlement.
+// Full async dispatch (used by EXEC replay and the per-conn deferred queue).
 export async function dispatch(
   ctx: ServerContext,
   conn: Connection,
@@ -160,6 +158,7 @@ export async function dispatch(
 ): Promise<void> {
   const spec = preDispatch(ctx, conn, registry, name, args);
   if (!spec) return;
+  ctx.totalCommands++;
   let out: any;
   try {
     out = await spec.handler(ctx, conn, args);

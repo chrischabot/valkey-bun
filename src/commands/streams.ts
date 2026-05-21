@@ -40,6 +40,17 @@ function entryToReply(e: { id: string; fields: Array<[string, Uint8Array]> }): R
   return RESP.arr([RESP.str(e.id), RESP.arr(fields)]);
 }
 
+function purgePending(s: Stream, id: string): void {
+  for (const g of s.groups.values()) {
+    const p = g.pending.get(id);
+    if (p) {
+      g.pending.delete(id);
+      const c = g.consumers.get(p.consumer);
+      if (c) c.pending = Math.max(0, c.pending - 1);
+    }
+  }
+}
+
 export const streamCommands: CommandSpec[] = [
   {
     name: "XADD",
@@ -102,9 +113,13 @@ export const streamCommands: CommandSpec[] = [
       for (let i = 1; i < args.length; i++) {
         const id = dec(args[i]!);
         const idx = s.entries.findIndex((e) => e.id === id);
-        if (idx >= 0) { s.entries.splice(idx, 1); n++; }
+        if (idx >= 0) {
+          s.entries.splice(idx, 1);
+          purgePending(s, id);
+          n++;
+        }
       }
-      ctx.bumpKey(conn.selectedDb, bytesToKey(args[0]!));
+      if (n > 0) ctx.bumpKey(conn.selectedDb, bytesToKey(args[0]!));
       return RESP.int(n);
     },
   },
@@ -121,13 +136,22 @@ export const streamCommands: CommandSpec[] = [
       if (i >= args.length) return RESP.err("ERR syntax error");
       const arg = dec(args[i]!);
       const before = s.entries.length;
+      let trimmed: { id: string }[] = [];
       if (mode === "MAXLEN") {
         const max = Number(arg);
-        if (s.entries.length > max) s.entries.splice(0, s.entries.length - max);
+        if (s.entries.length > max) trimmed = s.entries.splice(0, s.entries.length - max);
       } else if (mode === "MINID") {
-        s.entries = s.entries.filter((e) => compareIds(e.id, arg) >= 0);
+        const keep: typeof s.entries = [];
+        for (const e of s.entries) {
+          if (compareIds(e.id, arg) >= 0) keep.push(e);
+          else trimmed.push(e);
+        }
+        s.entries = keep;
       }
-      return RESP.int(before - s.entries.length);
+      for (const e of trimmed) purgePending(s, e.id);
+      const removed = before - s.entries.length;
+      if (removed > 0) ctx.bumpKey(conn.selectedDb, bytesToKey(args[0]!));
+      return RESP.int(removed);
     },
   },
   {
@@ -259,7 +283,7 @@ export const streamCommands: CommandSpec[] = [
       if (sub === "SETID") {
         const s = getStream(d, bytesToKey(args[1]!));
         const g = s?.groups.get(dec(args[2]!));
-        if (!g) return RESP.err("NOGROUP");
+        if (!g) return RESP.err("NOGROUP No such consumer group");
         g.lastDelivered = dec(args[3]!);
         return RESP.ok();
       }
@@ -296,15 +320,33 @@ export const streamCommands: CommandSpec[] = [
         const g = s.groups.get(groupName);
         if (!g) return RESP.err("NOGROUP No such key or consumer group");
         if (!g.consumers.has(consumer)) g.consumers.set(consumer, { name: consumer, lastSeen: Date.now(), pending: 0 });
-        const after = ids[j]! === ">" ? g.lastDelivered : ids[j]!;
-        const matches = s.entries.filter((e) => compareIds(e.id, after) > 0);
-        if (matches.length > 0) {
-          for (const e of matches) {
-            g.pending.set(e.id, { consumer, deliveredAt: Date.now(), deliveries: 1 });
-            g.consumers.get(consumer)!.pending++;
+        const requestedId = ids[j]!;
+        if (requestedId === ">") {
+          // New messages: deliver, add to PEL, advance last-delivered.
+          const matches = s.entries.filter((e) => compareIds(e.id, g.lastDelivered) > 0);
+          if (matches.length > 0) {
+            for (const e of matches) {
+              if (!g.pending.has(e.id)) {
+                g.pending.set(e.id, { consumer, deliveredAt: Date.now(), deliveries: 1 });
+                g.consumers.get(consumer)!.pending++;
+              }
+            }
+            g.lastDelivered = matches[matches.length - 1]!.id;
+            out.push(RESP.arr([RESP.str(keys[j]!), RESP.arr(matches.map(entryToReply))]));
           }
-          g.lastDelivered = matches[matches.length - 1]!.id;
-          out.push(RESP.arr([RESP.str(keys[j]!), RESP.arr(matches.map(entryToReply))]));
+        } else {
+          // Explicit ID: replay this consumer's pending history strictly
+          // greater than requestedId. Do NOT mutate PEL or counters.
+          const pendingForConsumer = Array.from(g.pending.entries())
+            .filter(([id, p]) => p.consumer === consumer && compareIds(id, requestedId) > 0)
+            .map(([id]) => id)
+            .sort(compareIds);
+          const replay: RespValue[] = [];
+          for (const id of pendingForConsumer) {
+            const e = s.entries.find((x) => x.id === id);
+            replay.push(e ? entryToReply(e) : RESP.arr([RESP.str(id), RESP.nil()]));
+          }
+          out.push(RESP.arr([RESP.str(keys[j]!), RESP.arr(replay)]));
         }
       }
       return out.length === 0 ? RESP.nil() : RESP.arr(out);
@@ -395,7 +437,7 @@ function xrange(ctx: any, conn: any, args: Uint8Array[], reverse: boolean): Resp
     if (dec(args[i]!).toUpperCase() === "COUNT") count = Number(dec(args[++i]!));
   }
   let entries = s.entries.filter((e) => compareIds(e.id, lo) >= 0 && compareIds(e.id, hi) <= 0);
-  if (reverse) entries.reverse();
+  if (reverse) entries = entries.slice().reverse();
   if (count > 0) entries = entries.slice(0, count);
   return RESP.arr(entries.map(entryToReply));
 }

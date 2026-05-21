@@ -66,6 +66,38 @@ export const pubsubCommands: CommandSpec[] = [
     },
   },
   {
+    // Sharded pub/sub. This is a single-node (non-clustered) server, so a
+    // shard channel is equivalent to a regular channel — SSUBSCRIBE shares
+    // the channel registry with SUBSCRIBE, matching how a standalone Redis
+    // node treats sharded pub/sub.
+    name: "SSUBSCRIBE",
+    arity: -2,
+    subscribeOk: true,
+    handler: (ctx, conn, args) => {
+      for (const a of args) {
+        const ch = dec(a);
+        const n = ctx.pubsub.subscribe(conn, ch);
+        conn.reply(subscribeReply(conn, "ssubscribe", ch, n));
+      }
+    },
+  },
+  {
+    name: "SUNSUBSCRIBE",
+    arity: -1,
+    subscribeOk: true,
+    handler: (ctx, conn, args) => {
+      const targets = args.length === 0 ? Array.from(conn.subscribedChannels) : args.map(dec);
+      if (targets.length === 0) {
+        conn.reply(subscribeReply(conn, "sunsubscribe", "", 0));
+        return;
+      }
+      for (const ch of targets) {
+        const n = ctx.pubsub.unsubscribe(conn, ch);
+        conn.reply(subscribeReply(conn, "sunsubscribe", ch, n));
+      }
+    },
+  },
+  {
     name: "PUBLISH",
     arity: 3,
     handler: (ctx, _conn, args) => RESP.int(ctx.pubsub.publish(dec(args[0]!), args[1]!)),
@@ -80,11 +112,13 @@ export const pubsubCommands: CommandSpec[] = [
     arity: -2,
     handler: (ctx, _conn, args) => {
       const sub = dec(args[0]!).toUpperCase();
-      if (sub === "CHANNELS") {
+      // On a standalone node the shard variants delegate to the same channel
+      // registry as their non-shard counterparts.
+      if (sub === "CHANNELS" || sub === "SHARDCHANNELS") {
         const pat = args[1] ? dec(args[1]!) : undefined;
         return RESP.arr(ctx.pubsub.channelList(pat).map((c: string) => RESP.str(c)));
       }
-      if (sub === "NUMSUB") {
+      if (sub === "NUMSUB" || sub === "SHARDNUMSUB") {
         const out: RespValue[] = [];
         for (let i = 1; i < args.length; i++) {
           const ch = dec(args[i]!);
@@ -94,8 +128,6 @@ export const pubsubCommands: CommandSpec[] = [
         return RESP.arr(out);
       }
       if (sub === "NUMPAT") return RESP.int(ctx.pubsub.numPat());
-      if (sub === "SHARDCHANNELS") return RESP.arr([]);
-      if (sub === "SHARDNUMSUB") return RESP.arr([]);
       return RESP.err(`ERR Unknown PUBSUB subcommand '${sub}'`);
     },
   },
