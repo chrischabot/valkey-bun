@@ -14,8 +14,9 @@ in [`docs/architecture.md`](./docs/architecture.md); user/API docs are in
 
 - Runtime: **Bun 1.3.14+** (`bun --version`). No Node, no npm scripts beyond
   `package.json`.
-- Install: `bun install` (only dep is `effect`; `ioredis`/`redis` are devDeps
-  for tests).
+- Install: `bun install` (runtime deps: `effect` for the control plane and
+  `fengari` for the embedded Lua VM; `ioredis`/`redis` are devDeps for
+  tests).
 - Run: `bun run start` (RESP `tcp/6379`, admin HTTP/3 `8080`).
 - Test: `bun test` — **46 tests must pass**. Never weaken or skip a test to go
   green; fix the root cause.
@@ -50,13 +51,29 @@ work complete.
    No-op operations must NOT bump (it would break optimistic locking). Keep
    this discipline when adding write commands.
 7. **Vendored Effect is not committed.** `vendor/` is gitignored. The runtime
-   dependency is the published `effect@4.0.0-beta.70`. For reference, clone
-   it on demand (see §7).
+   dependency is the published `effect@4.0.0-beta.70` plus `fengari` (a
+   pure-JS Lua 5.3 VM powering `EVAL`/`FUNCTION`). fengari ships no types, so
+   it is accessed through a single ambient `declare module "fengari"`
+   (`src/fengari.d.ts`) plus one structural cast in `src/lua.ts` — the same
+   accepted single-boundary pattern as the Bun-types casts. For reference,
+   clone Effect on demand (see §7).
 
 ## 4. Adding or changing a command
 
 1. Find the right module in `src/commands/` (by data type). The registry is
-   assembled in `src/commands/index.ts` (`buildRegistry`).
+   assembled in `src/commands/index.ts` (`buildRegistry`). Current modules:
+   `connection`, `keys`, `strings`, `hashes`, `hash-ttl` (Redis 7.4 field
+   TTL: `HEXPIRE`/`HTTL`/`HPERSIST`/`HGETEX`/`HGETDEL`), `lists`, `sets`,
+   `zsets`, `streams`, `pubsub`, `transactions`, `server`, `sort`
+   (`SORT`/`SORT_RO`), `bitmaps` (`SETBIT`…`BITFIELD`), `hll`
+   (`PFADD`/`PFCOUNT`/`PFMERGE`), `geo` (`GEOADD`/`GEOSEARCH`…), and
+   `scripting` (`EVAL`/`EVALSHA`/`SCRIPT`/`FUNCTION`/`FCALL`). Cross-cutting
+   support lives outside `commands/`: `src/lua.ts` (fengari Lua bridge),
+   `src/persistence.ts` + `src/rdb.ts` (AOF/RDB), and the `ServerContext`
+   waiter registry / keyspace-notification / `CLIENT TRACKING` machinery.
+   Per-key dispatcher hooks (AOF feed, keyspace notify, tracking
+   invalidation, read-capture) are centralized in `commands/index.ts`
+   `postWrite`/`maybeTrackRead`.
 2. Add a `CommandSpec`: `{ name, arity, handler, noQueue?, subscribeOk? }`.
    - `arity`: command name + args; negative for variadic.
    - `noQueue: true` only for transaction-control verbs (`MULTI`, `EXEC`,

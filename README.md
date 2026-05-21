@@ -90,8 +90,12 @@ orchestration, bare metal for the inner loop. See
 | AUTH / `requirepass` | ✅ |
 | HTTP/3 admin + Prometheus metrics | ✅ |
 | Multicore via `SO_REUSEPORT` | ✅ (per-worker state) |
-| Lua scripting (`EVAL`) | ⛔ explicit "not supported" error (stubs for client compat) |
-| On-disk persistence (RDB/AOF) | ⛔ intentionally ephemeral |
+| Bitmaps / HyperLogLog / Geo | ✅ |
+| Keyspace notifications | ✅ `notify-keyspace-events` |
+| RESP3 client-side caching (`CLIENT TRACKING`) | ✅ BCAST + default, REDIRECT, OPTIN/OPTOUT, NOLOOP |
+| Hash-field TTL (Redis 7.4) | ✅ `HEXPIRE`/`HTTL`/`HPERSIST`/`HGETEX`/`HGETDEL`/… |
+| Lua scripting (`EVAL`/`EVALSHA`/`FUNCTION`/`FCALL`) | ✅ embedded fengari VM |
+| On-disk persistence (AOF + RDB) | ✅ append-only file + CRC32-verified snapshots |
 | Replication / cluster sharding | ⛔ single-node |
 
 ## Quick client example
@@ -121,6 +125,39 @@ bun run bench          # production-realistic RESP benchmark
 bun run http-bench     # admin endpoint HTTP/1.1 vs HTTP/2 vs HTTP/3
 bun run typecheck      # strict tsc --noEmit
 ```
+
+## Known limitations
+
+- No replication or true cluster sharding (the cluster mode is process-level
+  `SO_REUSEPORT` with per-worker state).
+- `FUNCTION DUMP`/`RESTORE` use a portable internal payload, not the binary
+  redis-server format (round-trips within valkey2, not cross-server).
+- HTTP/3 is experimental in Bun 1.3.x (per the release notes); WebSocket over
+  HTTP/3 and 0-RTT are not available. The admin endpoint transparently falls
+  back to HTTP/2 / HTTP/1.1 over TLS on the same port.
+
+## Implemented beyond the original predecessor
+
+- **Persistence**: append-only file (RESP command log, `appendfsync`
+  always/everysec/no, load-on-boot with truncated-tail recovery, minimal
+  rewrite) plus a CRC32-verified custom RDB snapshot (`SAVE`/`BGSAVE`,
+  `save`-rule fibers, atomic temp-file rename) and `DUMP`/`RESTORE`.
+- **Bitmaps** (`SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP`/`BITFIELD`),
+  **HyperLogLog** (`PFADD`/`PFCOUNT`/`PFMERGE`, MurmurHash3 + loglog-beta),
+  **Geo** (`GEOADD`/`GEOSEARCH`/`GEODIST`/...).
+- **Genuine blocking family**: `BLPOP`/`BRPOP`, `BLMOVE`/`BRPOPLPUSH`,
+  `LMPOP`/`BLMPOP`, `BZPOPMIN`/`BZPOPMAX`/`ZMPOP`/`BZMPOP`, and real
+  `XREAD`/`XREADGROUP BLOCK`.
+- **Keyspace notifications** (`notify-keyspace-events`,
+  `__keyspace@/__keyevent@`), **RESP3 client-side caching**
+  (`CLIENT TRACKING` BCAST + default mode, REDIRECT, OPTIN/OPTOUT, NOLOOP).
+- **Redis 7.4 hash-field TTL** (`HEXPIRE`/`HTTL`/`HPERSIST`/`HGETEX`/
+  `HGETDEL`/...), `SORT`/`SORT_RO`, `LCS`, `EXPIRE ... NX|XX|GT|LT`.
+- **Lua scripting & Functions** via an embedded fengari VM:
+  `EVAL`/`EVALSHA`(`_RO`), `SCRIPT`, `FUNCTION`, `FCALL`(`_RO`).
+
+Runtime dependencies: `effect@4.0.0-beta.70` (control plane) and
+`fengari@^0.1.5` (embedded Lua VM). `ioredis`/`redis` are dev-only (tests).
 
 ## License
 

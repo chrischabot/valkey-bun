@@ -7,6 +7,7 @@ import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
 import { bytesToKey, keyToBytes, Stream, type Database, type StoredValue, type ValueType } from "../store";
 import { matchPattern } from "../pubsub";
+import { dumpValue, restoreValue } from "../rdb";
 
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
@@ -15,6 +16,41 @@ function db(ctx: any, conn: any): Database { return ctx.store.db(conn.selectedDb
 function typeName(v: StoredValue | undefined): ValueType {
   if (!v) return "none";
   return v.type;
+}
+
+// Shared EXPIRE-family flag handling (Redis 7.x NX|XX|GT|LT). Per the Redis
+// spec, a key with no TTL is treated as **infinity** for GT/LT comparisons:
+//   - GT sets only if new expiry > current; new (finite) is NOT > infinity,
+//     so GT on a persistent (no-TTL) key never sets -> returns 0.
+//   - LT sets only if new expiry < current; new (finite) IS < infinity,
+//     so LT on a persistent key always sets -> returns 1.
+function expireWithFlags(
+  ctx: any, conn: any, d: Database, k: string, newAbsMs: number, flagArgs: Uint8Array[],
+): RespValue {
+  let nx = false, xx = false, gt = false, lt = false;
+  for (const fb of flagArgs) {
+    const f = new TextDecoder().decode(fb).toUpperCase();
+    if (f === "NX") nx = true;
+    else if (f === "XX") xx = true;
+    else if (f === "GT") gt = true;
+    else if (f === "LT") lt = true;
+    else return RESP.err(`ERR Unsupported option ${f}`);
+  }
+  if (nx && (xx || gt || lt)) {
+    return RESP.err("ERR NX and XX, GT or LT options at the same time are not compatible");
+  }
+  if (gt && lt) {
+    return RESP.err("ERR GT and LT options at the same time are not compatible");
+  }
+  if (!d.exists(k)) return RESP.int(0);
+  const cur = d.expires.get(k); // undefined => no TTL (treated as +infinity)
+  if (nx && cur !== undefined) return RESP.int(0);
+  if (xx && cur === undefined) return RESP.int(0);
+  if (gt && (cur === undefined || newAbsMs <= cur)) return RESP.int(0);
+  if (lt && cur !== undefined && newAbsMs >= cur) return RESP.int(0);
+  d.setExpiry(k, newAbsMs);
+  ctx.bumpKey(conn.selectedDb, k);
+  return RESP.int(1);
 }
 
 export const keyCommands: CommandSpec[] = [
@@ -62,10 +98,7 @@ export const keyCommands: CommandSpec[] = [
       const k = bytesToKey(args[0]!);
       const seconds = Number(dec(args[1]!));
       if (!Number.isFinite(seconds)) return RESP.err("ERR value is not an integer or out of range");
-      if (!d.exists(k)) return RESP.int(0);
-      d.setExpiry(k, Date.now() + seconds * 1000);
-      ctx.bumpKey(conn.selectedDb, k);
-      return RESP.int(1);
+      return expireWithFlags(ctx, conn, d, k, Date.now() + seconds * 1000, args.slice(2));
     },
   },
   {
@@ -76,10 +109,7 @@ export const keyCommands: CommandSpec[] = [
       const k = bytesToKey(args[0]!);
       const ms = Number(dec(args[1]!));
       if (!Number.isFinite(ms)) return RESP.err("ERR value is not an integer or out of range");
-      if (!d.exists(k)) return RESP.int(0);
-      d.setExpiry(k, Date.now() + ms);
-      ctx.bumpKey(conn.selectedDb, k);
-      return RESP.int(1);
+      return expireWithFlags(ctx, conn, d, k, Date.now() + ms, args.slice(2));
     },
   },
   {
@@ -90,10 +120,7 @@ export const keyCommands: CommandSpec[] = [
       const k = bytesToKey(args[0]!);
       const t = Number(dec(args[1]!));
       if (!Number.isFinite(t)) return RESP.err("ERR value is not an integer or out of range");
-      if (!d.exists(k)) return RESP.int(0);
-      d.setExpiry(k, t * 1000);
-      ctx.bumpKey(conn.selectedDb, k);
-      return RESP.int(1);
+      return expireWithFlags(ctx, conn, d, k, t * 1000, args.slice(2));
     },
   },
   {
@@ -104,10 +131,7 @@ export const keyCommands: CommandSpec[] = [
       const k = bytesToKey(args[0]!);
       const t = Number(dec(args[1]!));
       if (!Number.isFinite(t)) return RESP.err("ERR value is not an integer or out of range");
-      if (!d.exists(k)) return RESP.int(0);
-      d.setExpiry(k, t);
-      ctx.bumpKey(conn.selectedDb, k);
-      return RESP.int(1);
+      return expireWithFlags(ctx, conn, d, k, t, args.slice(2));
     },
   },
   {
@@ -161,7 +185,9 @@ export const keyCommands: CommandSpec[] = [
       const d = db(ctx, conn);
       const k = bytesToKey(args[0]!);
       if (!d.exists(k)) return RESP.int(0);
-      return RESP.int(d.removeExpiry(k) ? 1 : 0);
+      const removed = d.removeExpiry(k);
+      if (removed) ctx.bumpKey(conn.selectedDb, k);
+      return RESP.int(removed ? 1 : 0);
     },
   },
   {
@@ -339,6 +365,49 @@ export const keyCommands: CommandSpec[] = [
       let n = 0;
       for (const a of args) if (d.exists(bytesToKey(a))) n++;
       return RESP.int(n);
+    },
+  },
+  {
+    name: "DUMP",
+    arity: 2,
+    handler: (ctx, conn, args) => {
+      const v = db(ctx, conn).getRaw(bytesToKey(args[0]!));
+      if (!v) return RESP.nil();
+      return { type: "bulk", value: dumpValue(v) };
+    },
+  },
+  {
+    name: "RESTORE",
+    arity: -4,
+    handler: (ctx, conn, args) => {
+      const d = db(ctx, conn);
+      const k = bytesToKey(args[0]!);
+      const ttl = Number(dec(args[1]!));
+      if (!Number.isFinite(ttl) || ttl < 0) return RESP.err("ERR Invalid TTL value, must be >= 0");
+      let replace = false, absttl = false;
+      for (let i = 3; i < args.length; i++) {
+        const opt = dec(args[i]!).toUpperCase();
+        if (opt === "REPLACE") replace = true;
+        else if (opt === "ABSTTL") absttl = true;
+        else if (opt === "IDLETIME" || opt === "FREQ") {
+          if (i + 1 >= args.length) return RESP.err("ERR syntax error");
+          i++;
+        } else return RESP.err("ERR syntax error");
+      }
+      if (!replace && d.exists(k)) return RESP.err("BUSYKEY Target key name already exists.");
+      let value;
+      try {
+        value = restoreValue(args[2]!);
+      } catch (e: any) {
+        return RESP.err(e?.message ?? "ERR Bad data format");
+      }
+      if (ttl > 0) {
+        d.set(k, value, { expireAt: absttl ? ttl : Date.now() + ttl });
+      } else {
+        d.set(k, value);
+      }
+      ctx.bumpKey(conn.selectedDb, k);
+      return RESP.ok();
     },
   },
   {

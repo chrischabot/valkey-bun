@@ -122,7 +122,7 @@ export const zsetCommands: CommandSpec[] = [
         incrApplied = true;
       }
       const mutated = added > 0 || changed > 0;
-      if (mutated) ctx.bumpKey(conn.selectedDb, k);
+      if (mutated) { ctx.bumpKey(conn.selectedDb, k); ctx.notifyKey(conn.selectedDb, k); }
       if (z.size() === 0 && !existed) d.delete(k);
       if (incr) return incrApplied ? scoreReply(conn, lastScore) : RESP.nil();
       return RESP.int(ch ? added + changed : added);
@@ -180,6 +180,7 @@ export const zsetCommands: CommandSpec[] = [
       const next = (z.score(m) ?? 0) + delta;
       z.setScore(m, next);
       ctx.bumpKey(conn.selectedDb, k);
+      ctx.notifyKey(conn.selectedDb, k);
       return scoreReply(conn, next);
     },
   },
@@ -332,6 +333,7 @@ export const zsetCommands: CommandSpec[] = [
       for (const e of entries) out.setScore(e.member, e.score);
       d.set(dst, { type: "zset", value: out });
       ctx.bumpKey(conn.selectedDb, dst);
+      ctx.notifyKey(conn.selectedDb, dst);
       return RESP.int(entries.length);
     },
   },
@@ -375,6 +377,88 @@ export const zsetCommands: CommandSpec[] = [
       return RESP.arr([RESP.str(String(next)), RESP.arr(out)]);
     },
   },
+  {
+    name: "ZREMRANGEBYRANK",
+    arity: 4,
+    handler: (ctx, conn, args) => {
+      const d = db(ctx, conn);
+      const k = bytesToKey(args[0]!);
+      const z = getZSet(d, k);
+      if (!z) return RESP.int(0);
+      const entries = z.sortedEntries();
+      const len = entries.length;
+      let start = Number(dec(args[1]!));
+      let stop = Number(dec(args[2]!));
+      if (start < 0) start = Math.max(0, len + start);
+      if (stop < 0) stop = len + stop;
+      if (start >= len || start > stop) return RESP.int(0);
+      stop = Math.min(stop, len - 1);
+      const victims = entries.slice(start, stop + 1);
+      for (const e of victims) z.remove(e.member);
+      if (z.size() === 0) d.delete(k);
+      if (victims.length) ctx.bumpKey(conn.selectedDb, k);
+      return RESP.int(victims.length);
+    },
+  },
+  {
+    name: "ZREMRANGEBYSCORE",
+    arity: 4,
+    handler: (ctx, conn, args) => {
+      const d = db(ctx, conn);
+      const k = bytesToKey(args[0]!);
+      const z = getZSet(d, k);
+      if (!z) return RESP.int(0);
+      const r = parseScoreRange(dec(args[1]!), dec(args[2]!));
+      const victims = z.sortedEntries().filter((e) => inScoreRange(e.score, r));
+      for (const e of victims) z.remove(e.member);
+      if (z.size() === 0) d.delete(k);
+      if (victims.length) ctx.bumpKey(conn.selectedDb, k);
+      return RESP.int(victims.length);
+    },
+  },
+  {
+    name: "ZREMRANGEBYLEX",
+    arity: 4,
+    handler: (ctx, conn, args) => {
+      const d = db(ctx, conn);
+      const k = bytesToKey(args[0]!);
+      const z = getZSet(d, k);
+      if (!z) return RESP.int(0);
+      const victims = z.sortedEntries().filter((e) => inLexRange(e.member, dec(args[1]!), dec(args[2]!)));
+      for (const e of victims) z.remove(e.member);
+      if (z.size() === 0) d.delete(k);
+      if (victims.length) ctx.bumpKey(conn.selectedDb, k);
+      return RESP.int(victims.length);
+    },
+  },
+  {
+    name: "ZMPOP",
+    arity: -4,
+    handler: (ctx, conn, args) => {
+      const parsed = parseZMpop(args, 0);
+      if (typeof parsed === "string") return RESP.err(parsed);
+      return zmpopOnce(ctx, conn, parsed.keys, parsed.max, parsed.count) ?? RESP.arr(null);
+    },
+  },
+  {
+    name: "BZMPOP",
+    arity: -5,
+    handler: (ctx, conn, args) => {
+      const timeout = Number(dec(args[0]!));
+      if (!Number.isFinite(timeout) || timeout < 0) return RESP.err("ERR timeout is not a float or out of range");
+      const parsed = parseZMpop(args, 1);
+      if (typeof parsed === "string") return RESP.err(parsed);
+      const immediate = zmpopOnce(ctx, conn, parsed.keys, parsed.max, parsed.count);
+      if (immediate) return immediate;
+      return ctx.registerWaiter(
+        conn.selectedDb, parsed.keys, timeout,
+        () => zmpopOnce(ctx, conn, parsed.keys, parsed.max, parsed.count),
+        () => RESP.arr(null),
+      ) as Promise<RespValue>;
+    },
+  },
+  { name: "BZPOPMIN", arity: -3, handler: (ctx, conn, args) => bzpop(ctx, conn, args, false) },
+  { name: "BZPOPMAX", arity: -3, handler: (ctx, conn, args) => bzpop(ctx, conn, args, true) },
 ];
 
 function zrangeRev(ctx: any, conn: any, args: Uint8Array[]): RespValue {
@@ -564,6 +648,7 @@ function zsetOp(ctx: any, conn: any, args: Uint8Array[], op: "union" | "inter" |
       d.set(dest, { type: "zset", value: z });
     }
     ctx.bumpKey(conn.selectedDb, dest);
+    if (result.size > 0) ctx.notifyKey(conn.selectedDb, dest);
     return RESP.int(result.size);
   }
   const z = new ZSet();
@@ -575,4 +660,82 @@ function combine(a: number, b: number, agg: "SUM" | "MIN" | "MAX"): number {
   if (agg === "SUM") return a + b;
   if (agg === "MIN") return Math.min(a, b);
   return Math.max(a, b);
+}
+
+interface ZMpopSpec { keys: string[]; max: boolean; count: number; }
+function parseZMpop(args: Uint8Array[], start: number): ZMpopSpec | string {
+  const numKeys = Number(dec(args[start]!));
+  if (!Number.isInteger(numKeys) || numKeys <= 0) return "ERR numkeys should be greater than 0";
+  const keys: string[] = [];
+  for (let i = 0; i < numKeys; i++) {
+    if (start + 1 + i >= args.length) return "ERR syntax error";
+    keys.push(bytesToKey(args[start + 1 + i]!));
+  }
+  let idx = start + 1 + numKeys;
+  if (idx >= args.length) return "ERR syntax error";
+  const where = dec(args[idx]!).toUpperCase();
+  if (where !== "MIN" && where !== "MAX") return "ERR syntax error";
+  idx++;
+  let count = 1;
+  if (idx < args.length) {
+    if (dec(args[idx]!).toUpperCase() !== "COUNT" || idx + 1 >= args.length) return "ERR syntax error";
+    count = Number(dec(args[idx + 1]!));
+    if (!Number.isInteger(count) || count <= 0) return "ERR count should be greater than 0";
+    idx += 2;
+  }
+  if (idx !== args.length) return "ERR syntax error";
+  return { keys, max: where === "MAX", count };
+}
+
+function zmpopOnce(ctx: any, conn: any, keys: string[], max: boolean, count: number): RespValue | null {
+  const d = db(ctx, conn);
+  for (const key of keys) {
+    const z = getZSet(d, key);
+    if (z && z.size() > 0) {
+      let entries = z.sortedEntries();
+      if (max) entries = entries.slice().reverse();
+      const picked = entries.slice(0, count);
+      const pairs: RespValue[] = [];
+      for (const e of picked) {
+        z.remove(e.member);
+        pairs.push(RESP.arr([
+          { type: "bulk", value: keyToBytes(e.member) },
+          { type: "bulk", value: new TextEncoder().encode(fmtScore(e.score)) },
+        ]));
+      }
+      if (z.size() === 0) d.delete(key);
+      ctx.bumpKey(conn.selectedDb, key);
+      return RESP.arr([{ type: "bulk", value: keyToBytes(key) }, RESP.arr(pairs)]);
+    }
+  }
+  return null;
+}
+
+function bzpop(ctx: any, conn: any, args: Uint8Array[], max: boolean): RespValue | Promise<RespValue> {
+  const timeout = Number(dec(args[args.length - 1]!));
+  if (!Number.isFinite(timeout) || timeout < 0) return RESP.err("ERR timeout is not a float or out of range");
+  const keys = args.slice(0, -1).map((a) => bytesToKey(a));
+  const attempt = (): RespValue | null => {
+    const d = db(ctx, conn);
+    for (const key of keys) {
+      const z = getZSet(d, key);
+      if (z && z.size() > 0) {
+        let entries = z.sortedEntries();
+        if (max) entries = entries.slice().reverse();
+        const e = entries[0]!;
+        z.remove(e.member);
+        if (z.size() === 0) d.delete(key);
+        ctx.bumpKey(conn.selectedDb, key);
+        return RESP.arr([
+          { type: "bulk", value: keyToBytes(key) },
+          { type: "bulk", value: keyToBytes(e.member) },
+          { type: "bulk", value: new TextEncoder().encode(fmtScore(e.score)) },
+        ]);
+      }
+    }
+    return null;
+  };
+  const immediate = attempt();
+  if (immediate) return immediate;
+  return ctx.registerWaiter(conn.selectedDb, keys, timeout, attempt, () => RESP.arr(null)) as Promise<RespValue>;
 }

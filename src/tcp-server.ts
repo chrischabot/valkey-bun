@@ -5,6 +5,7 @@ import { ServerContext } from "./server-context";
 import type { ResolvedConfig } from "./config";
 import { buildRegistry, dispatch, dispatchSync } from "./commands";
 import { setTransactionRegistry } from "./commands/transactions";
+import { Persistence } from "./persistence";
 
 const ENCODER = new TextEncoder();
 const EMPTY = new Uint8Array(0);
@@ -20,6 +21,15 @@ export function startTcpServer(config: ResolvedConfig & { reusePort?: boolean })
   const ctx = new ServerContext(config);
   const registry = buildRegistry();
   setTransactionRegistry(registry);
+  ctx.registry = registry;
+
+  const cfgMaybe = config as Partial<ResolvedConfig>;
+  if (cfgMaybe.dir !== undefined) {
+    const persist = new Persistence(ctx, config);
+    ctx.persist = persist;
+    persist.load();
+    persist.start();
+  }
 
   // Per-connection async tail. When set, subsequent commands MUST defer to
   // preserve reply order; the value is the chained promise of pending work.
@@ -105,6 +115,7 @@ export function startTcpServer(config: ResolvedConfig & { reusePort?: boolean })
         const conn = socket.data?.conn;
         if (conn) {
           ctx.pubsub.removeConnection(conn);
+          ctx.untrackConnection(conn);
           ctx.connections.delete(conn);
           conn.closed = true;
         }
@@ -113,6 +124,7 @@ export function startTcpServer(config: ResolvedConfig & { reusePort?: boolean })
         const conn = socket.data?.conn;
         if (conn) {
           ctx.pubsub.removeConnection(conn);
+          ctx.untrackConnection(conn);
           ctx.connections.delete(conn);
           conn.closed = true;
         }

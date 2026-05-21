@@ -120,17 +120,88 @@ export const connectionCommands: CommandSpec[] = [
           return RESP.str(lines.join("\n"));
         }
         case "NO-EVICT": case "NO-TOUCH": case "REPLY": case "PAUSE":
-        case "UNPAUSE": case "TRACKING": case "SETINFO": return RESP.ok();
-        case "GETREDIR": return RESP.int(-1);
-        case "TRACKINGINFO":
+        case "UNPAUSE": case "SETINFO": return RESP.ok();
+        case "TRACKING": {
+          if (args.length < 2) return RESP.err("ERR wrong number of arguments");
+          const mode = dec(args[1]!).toUpperCase();
+          if (mode !== "ON" && mode !== "OFF") return RESP.err("ERR syntax error");
+          let redirect = 0;
+          let bcast = false, optin = false, optout = false, noloop = false;
+          const prefixes: string[] = [];
+          for (let i = 2; i < args.length; i++) {
+            const o = dec(args[i]!).toUpperCase();
+            if (o === "REDIRECT") {
+              if (i + 1 >= args.length) return RESP.err("ERR syntax error");
+              redirect = Number(dec(args[++i]!));
+              if (!Number.isInteger(redirect) || redirect < 0) return RESP.err("ERR syntax error");
+            } else if (o === "PREFIX") {
+              if (i + 1 >= args.length) return RESP.err("ERR syntax error");
+              prefixes.push(dec(args[++i]!));
+            } else if (o === "BCAST") bcast = true;
+            else if (o === "OPTIN") optin = true;
+            else if (o === "OPTOUT") optout = true;
+            else if (o === "NOLOOP") noloop = true;
+            else return RESP.err("ERR syntax error");
+          }
+          if (mode === "OFF") { ctx.untrackConnection(conn); return RESP.ok(); }
+          if (optin && optout) {
+            return RESP.err("ERR You can't specify both OPTIN mode and OPTOUT mode");
+          }
+          if (prefixes.length > 0 && !bcast) {
+            return RESP.err("ERR PREFIX option requires BCAST mode to be enabled");
+          }
+          if ((optin || optout) && bcast) {
+            return RESP.err("ERR OPTIN and OPTOUT are not compatible with BCAST");
+          }
+          if (redirect > 0 && !ctx.findConnection(redirect)) {
+            return RESP.err("ERR The client ID you want redirect to does not exist");
+          }
+          ctx.untrackConnection(conn);
+          conn.tracking = true;
+          conn.trackingBcast = bcast;
+          conn.trackingPrefixes = prefixes;
+          conn.trackingRedirect = redirect;
+          conn.trackingOptin = optin;
+          conn.trackingOptout = optout;
+          conn.trackingNoloop = noloop;
+          conn.caching = null;
+          ctx.trackingClients.add(conn);
+          return RESP.ok();
+        }
+        case "CACHING": {
+          if (args.length < 2) return RESP.err("ERR wrong number of arguments");
+          if (!conn.tracking || (!conn.trackingOptin && !conn.trackingOptout)) {
+            return RESP.err("ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled");
+          }
+          const yn = dec(args[1]!).toUpperCase();
+          if (yn === "YES") conn.caching = true;
+          else if (yn === "NO") conn.caching = false;
+          else return RESP.err("ERR syntax error");
+          return RESP.ok();
+        }
+        case "GETREDIR":
+          return RESP.int(conn.tracking ? conn.trackingRedirect : -1);
+        case "TRACKINGINFO": {
+          const flags: any[] = [];
+          if (!conn.tracking) flags.push(RESP.str("off"));
+          else {
+            flags.push(RESP.str("on"));
+            if (conn.trackingBcast) flags.push(RESP.str("bcast"));
+            if (conn.trackingOptin) flags.push(RESP.str("optin"));
+            if (conn.trackingOptout) flags.push(RESP.str("optout"));
+            if (conn.trackingNoloop) flags.push(RESP.str("noloop"));
+            if (conn.caching === true) flags.push(RESP.str("caching-yes"));
+            if (conn.caching === false) flags.push(RESP.str("caching-no"));
+          }
           return {
             type: "map",
             value: [
-              [RESP.str("flags"), RESP.arr([])],
-              [RESP.str("redirect"), RESP.int(-1)],
-              [RESP.str("prefixes"), RESP.arr([])],
+              [RESP.str("flags"), RESP.arr(flags)],
+              [RESP.str("redirect"), RESP.int(conn.tracking ? conn.trackingRedirect : -1)],
+              [RESP.str("prefixes"), RESP.arr(conn.trackingPrefixes.map((p) => RESP.str(p)))],
             ],
           };
+        }
         case "KILL": return RESP.ok();
         default: return RESP.err(`ERR Unknown CLIENT subcommand '${sub}'`);
       }
@@ -142,6 +213,7 @@ export const connectionCommands: CommandSpec[] = [
     subscribeOk: true,
     handler: (ctx, conn) => {
       ctx.pubsub.removeConnection(conn);
+      ctx.untrackConnection(conn);
       conn.inMulti = false;
       conn.multiQueue = [];
       conn.multiError = false;

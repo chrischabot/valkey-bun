@@ -11,6 +11,16 @@ export interface ResolvedConfig {
   readonly dbCount: number;
   readonly clusterSize: number;
   readonly adminPort: number;
+  // Persistence
+  readonly dir: string;
+  readonly dbfilename: string;
+  readonly appendonly: boolean;
+  readonly appendfilename: string;
+  readonly appendfsync: "always" | "everysec" | "no";
+  readonly save: string;
+  readonly aofUseRdbPreamble: boolean;
+  // Keyspace notifications (flag string, e.g. "KEA")
+  readonly notifyKeyspaceEvents: string;
 }
 
 // Service: contract only (effect.solutions — Services & Layers). Tag id uses
@@ -35,6 +45,25 @@ const loadConfig = Effect.gen(function* () {
   );
   const password = Redacted.value(passwordRedacted);
 
+  const dir = yield* Config.string("VALKEY_DIR").pipe(Config.withDefault("."));
+  const dbfilename = yield* Config.string("VALKEY_DBFILENAME").pipe(Config.withDefault("dump.rdb"));
+  const appendonlyStr = yield* Config.string("VALKEY_APPENDONLY").pipe(Config.withDefault("no"));
+  const appendfilename = yield* Config.string("VALKEY_APPENDFILENAME").pipe(
+    Config.withDefault("appendonly.aof"),
+  );
+  const appendfsyncStr = yield* Config.string("VALKEY_APPENDFSYNC").pipe(
+    Config.withDefault("everysec"),
+  );
+  const save = yield* Config.string("VALKEY_SAVE").pipe(
+    Config.withDefault("3600 1 300 100 60 10000"),
+  );
+  const aofPreambleStr = yield* Config.string("VALKEY_AOF_USE_RDB_PREAMBLE").pipe(
+    Config.withDefault("yes"),
+  );
+  const notifyKeyspaceEvents = yield* Config.string("VALKEY_NOTIFY_KEYSPACE_EVENTS").pipe(
+    Config.withDefault(""),
+  );
+
   if (dbCount < 1) {
     return yield* new ConfigError({
       field: "VALKEY_DBCOUNT",
@@ -53,6 +82,35 @@ const loadConfig = Effect.gen(function* () {
       reason: `must be >= 1, got ${maxClients}`,
     });
   }
+  const fsync = appendfsyncStr.toLowerCase();
+  if (fsync !== "always" && fsync !== "everysec" && fsync !== "no") {
+    return yield* new ConfigError({
+      field: "VALKEY_APPENDFSYNC",
+      reason: `must be always|everysec|no, got ${appendfsyncStr}`,
+    });
+  }
+  const parseBool = function* (field: string, raw: string) {
+    if (/^(yes|true|1)$/i.test(raw)) return true;
+    if (/^(no|false|0)$/i.test(raw)) return false;
+    return yield* new ConfigError({ field, reason: `must be yes|no|true|false|1|0, got ${raw}` });
+  };
+  const appendonly = yield* parseBool("VALKEY_APPENDONLY", appendonlyStr);
+  const aofUseRdbPreamble = yield* parseBool("VALKEY_AOF_USE_RDB_PREAMBLE", aofPreambleStr);
+  if (save.trim().length > 0) {
+    const parts = save.trim().split(/\s+/);
+    if (parts.length % 2 !== 0 || parts.some((p) => !/^\d+$/.test(p))) {
+      return yield* new ConfigError({
+        field: "VALKEY_SAVE",
+        reason: `must be space-separated <seconds> <changes> integer pairs, got "${save}"`,
+      });
+    }
+  }
+  if (notifyKeyspaceEvents.length > 0 && !/^[KEg$lshzxetmdnA]+$/.test(notifyKeyspaceEvents)) {
+    return yield* new ConfigError({
+      field: "VALKEY_NOTIFY_KEYSPACE_EVENTS",
+      reason: `contains unknown flag characters: "${notifyKeyspaceEvents}"`,
+    });
+  }
 
   const resolved: ResolvedConfig = {
     host,
@@ -62,6 +120,14 @@ const loadConfig = Effect.gen(function* () {
     dbCount,
     clusterSize,
     adminPort,
+    dir,
+    dbfilename,
+    appendonly,
+    appendfilename,
+    appendfsync: fsync as "always" | "everysec" | "no",
+    save,
+    aofUseRdbPreamble,
+    notifyKeyspaceEvents,
   };
   return resolved;
 });

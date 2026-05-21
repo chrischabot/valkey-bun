@@ -20,6 +20,12 @@ against this server.
 7. [Benchmarking](./benchmarking.md) — the RESP and HTTP benchmarks.
 8. [Deployment](./deployment.md) — multicore, operations, limitations.
 9. [Development](./development.md) — project layout, tests, extending it.
+10. [Persistence](./persistence.md) — AOF, custom RDB, `DUMP`/`RESTORE`.
+11. [Client-side caching & keyspace notifications](./client-side-caching.md) —
+    `CLIENT TRACKING` and `notify-keyspace-events`.
+12. [Roadmap](./roadmap.md) — research & design for persistence, pub/sub
+    completeness, and full command coverage (how close to real Redis,
+    single-node).
 
 ## Command reference
 
@@ -34,11 +40,15 @@ command** with syntax, time complexity notes, options, the exact RESP reply
 - [Sets](./commands/sets.md)
 - [Sorted sets](./commands/sorted-sets.md)
 - [Streams](./commands/streams.md) (incl. consumer groups)
+- [Bitmaps](./commands/bitmaps.md)
+- [HyperLogLog](./commands/hyperloglog.md)
+- [Geo](./commands/geo.md)
+- [Hash field TTL](./commands/hash-ttl.md) (Redis 7.4)
 - [Pub/Sub](./commands/pubsub.md) (incl. sharded)
 - [Transactions](./commands/transactions.md)
 - [Connection / client](./commands/connection.md)
 - [Server / admin commands](./commands/server.md)
-- [Scripting](./commands/scripting.md)
+- [Scripting](./commands/scripting.md) (Lua via embedded fengari)
 
 ## Conventions used throughout these docs
 

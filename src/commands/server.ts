@@ -62,19 +62,25 @@ export const serverCommands: CommandSpec[] = [
   {
     name: "COMMAND",
     arity: -1,
-    handler: (_ctx, conn, args) => {
+    handler: (ctx, conn, args) => {
       if (args.length === 0) return RESP.arr([]);
       const sub = dec(args[0]!).toUpperCase();
       switch (sub) {
-        case "COUNT": return RESP.int(200);
-        case "LIST": return RESP.arr([]);
+        case "COUNT": return RESP.int(ctx.registry ? ctx.registry.list().length : 200);
+        case "LIST": {
+          if (!ctx.registry) return RESP.arr([]);
+          return RESP.arr(ctx.registry.list().map((s: any) => RESP.str(s.name.toLowerCase())));
+        }
         case "DOCS": return conn.resp3 ? { type: "map", value: [] } : RESP.arr([]);
         case "INFO": {
           const out: RespValue[] = [];
           for (let i = 1; i < args.length; i++) out.push(RESP.nil());
           return RESP.arr(out);
         }
-        case "GETKEYS": return RESP.arr([]);
+        case "GETKEYS": {
+          if (args.length < 3) return RESP.err("ERR Invalid command specified");
+          return RESP.arr([{ type: "bulk", value: args[2]! }]);
+        }
         default: return RESP.err(`ERR Unknown COMMAND subcommand '${sub}'`);
       }
     },
@@ -96,7 +102,16 @@ export const serverCommands: CommandSpec[] = [
           return RESP.arr(out);
         }
         case "SET":
-          for (let i = 1; i < args.length; i += 2) ctx.configMap.set(dec(args[i]!).toLowerCase(), dec(args[i + 1]!));
+          for (let i = 1; i < args.length; i += 2) {
+            const key = dec(args[i]!).toLowerCase();
+            const val = dec(args[i + 1]!);
+            ctx.configMap.set(key, val);
+            if (key === "appendonly" && ctx.persist) {
+              if (/^(yes|true|1)$/i.test(val)) ctx.persist.enableAof();
+              else ctx.persist.disableAof();
+            }
+            if (key === "notify-keyspace-events") ctx.setNotifyKeyspaceEvents(val);
+          }
           return RESP.ok();
         case "RESETSTAT":
         case "REWRITE": return RESP.ok();
@@ -126,11 +141,36 @@ export const serverCommands: CommandSpec[] = [
       return RESP.arr([RESP.str(String(Math.floor(ms / 1000))), RESP.str(String((ms % 1000) * 1000))]);
     },
   },
-  { name: "SHUTDOWN", arity: -1, handler: () => { setTimeout(() => process.exit(0), 50); return RESP.ok(); } },
-  { name: "LASTSAVE", arity: 1, handler: (ctx) => RESP.int(Math.floor(ctx.startTime / 1000)) },
-  { name: "BGSAVE", arity: -1, handler: () => RESP.simple("Background saving started") },
-  { name: "SAVE", arity: 1, handler: () => RESP.ok() },
-  { name: "BGREWRITEAOF", arity: 1, handler: () => RESP.simple("Background append only file rewriting started") },
+  {
+    name: "SHUTDOWN",
+    arity: -1,
+    handler: (ctx) => {
+      try { ctx.persist?.flushOnShutdown(); } catch { /* best effort */ }
+      setTimeout(() => process.exit(0), 50);
+      return RESP.ok();
+    },
+  },
+  { name: "LASTSAVE", arity: 1, handler: (ctx) => RESP.int(ctx.persist ? ctx.persist.lastSaveSec : Math.floor(ctx.startTime / 1000)) },
+  {
+    name: "BGSAVE",
+    arity: -1,
+    handler: (ctx) => { ctx.persist?.bgsave(); return RESP.simple("Background saving started"); },
+  },
+  {
+    name: "SAVE",
+    arity: 1,
+    handler: (ctx) => { ctx.persist?.save(); return RESP.ok(); },
+  },
+  {
+    name: "BGREWRITEAOF",
+    arity: 1,
+    handler: (ctx) => { ctx.persist?.rewriteAof(); return RESP.simple("Background append only file rewriting started"); },
+  },
+  {
+    name: "WAITAOF",
+    arity: 4,
+    handler: (ctx) => RESP.arr([RESP.int(ctx.persist?.aofEnabled ? 1 : 0), RESP.int(0)]),
+  },
   {
     name: "MEMORY",
     arity: -2,
