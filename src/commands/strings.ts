@@ -341,6 +341,84 @@ export const stringCommands: CommandSpec[] = [
   },
   { name: "GETRANGE", arity: 4, handler: (ctx, conn, args) => getRange(ctx, conn, args) },
   { name: "SUBSTR", arity: 4, handler: (ctx, conn, args) => getRange(ctx, conn, args) },
+  {
+    name: "LCS",
+    arity: -3,
+    handler: (ctx, conn, args) => {
+      const d = db(ctx, conn);
+      const v1 = d.getRaw(bytesToKey(args[0]!));
+      const v2 = d.getRaw(bytesToKey(args[1]!));
+      if ((v1 && v1.type !== "string") || (v2 && v2.type !== "string")) {
+        return RESP.err("WRONGTYPE The specified keys must contain string values");
+      }
+      const a = v1 ? dec(v1.value) : "";
+      const b = v2 ? dec(v2.value) : "";
+      let wantLen = false, wantIdx = false, withMatchLen = false, minMatchLen = 0;
+      for (let i = 2; i < args.length; i++) {
+        const opt = dec(args[i]!).toUpperCase();
+        if (opt === "LEN") wantLen = true;
+        else if (opt === "IDX") wantIdx = true;
+        else if (opt === "WITHMATCHLEN") withMatchLen = true;
+        else if (opt === "MINMATCHLEN") {
+          if (i + 1 >= args.length) return RESP.err("ERR syntax error");
+          minMatchLen = Number(dec(args[++i]!));
+          if (!Number.isInteger(minMatchLen) || minMatchLen < 0) return RESP.err("ERR syntax error");
+        } else return RESP.err("ERR syntax error");
+      }
+      if (wantLen && wantIdx) {
+        return RESP.err("ERR If you want both the length and indexes, please just use IDX.");
+      }
+      const n = a.length, m = b.length;
+      const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+      for (let i = 1; i <= n; i++) {
+        for (let j = 1; j <= m; j++) {
+          dp[i]![j] = a[i - 1] === b[j - 1]
+            ? dp[i - 1]![j - 1]! + 1
+            : Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+        }
+      }
+      if (wantLen) return RESP.int(dp[n]![m]!);
+      let i = n, j = m;
+      const seq: string[] = [];
+      const matches: RespValue[] = [];
+      let aEnd = -1, bEnd = -1, runLen = 0;
+      const flush = (aStart: number, bStart: number) => {
+        if (runLen > 0 && runLen >= minMatchLen) {
+          const row: RespValue[] = [
+            RESP.arr([RESP.int(aStart), RESP.int(aEnd)]),
+            RESP.arr([RESP.int(bStart), RESP.int(bEnd)]),
+          ];
+          if (withMatchLen) row.push(RESP.int(runLen));
+          matches.push(RESP.arr(row));
+        }
+        runLen = 0;
+      };
+      while (i > 0 && j > 0) {
+        if (a[i - 1] === b[j - 1]) {
+          seq.push(a[i - 1]!);
+          if (runLen === 0) { aEnd = i - 1; bEnd = j - 1; }
+          runLen++;
+          i--; j--;
+        } else {
+          if (runLen > 0) flush(i, j);
+          if (dp[i - 1]![j]! >= dp[i]![j - 1]!) i--;
+          else j--;
+        }
+      }
+      if (runLen > 0) flush(i, j);
+      const lcsStr = seq.reverse().join("");
+      if (wantIdx) {
+        return {
+          type: "map",
+          value: [
+            [RESP.str("matches"), RESP.arr(matches)],
+            [RESP.str("len"), RESP.int(dp[n]![m]!)],
+          ],
+        };
+      }
+      return { type: "bulk", value: enc(lcsStr) };
+    },
+  },
 ];
 
 function getRange(ctx: any, conn: any, args: Uint8Array[]): RespValue {

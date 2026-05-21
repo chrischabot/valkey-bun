@@ -47,7 +47,11 @@ if (clusterEnv > 1 && !process.env.VALKEY_WORKER) {
       ` ready in ${ms}ms`,
     );
 
-    const shutdown = () => { try { admin?.stop(); } catch { /* ignore */ } process.exit(0); };
+    const shutdown = () => {
+      try { ctx.persist?.flushOnShutdown(); } catch { /* ignore */ }
+      try { admin?.stop(); } catch { /* ignore */ }
+      process.exit(0);
+    };
     process.on("SIGTERM", shutdown);
     process.on("SIGINT", shutdown);
 

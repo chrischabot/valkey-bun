@@ -24,6 +24,16 @@ export class Connection {
   subscribedPatterns = new Set<string>();
   closed = false;
 
+  tracking = false;
+  trackingBcast = false;
+  trackingPrefixes: string[] = [];
+  trackingRedirect = 0;
+  trackingOptin = false;
+  trackingOptout = false;
+  trackingNoloop = false;
+  caching: boolean | null = null;
+  trackedKeys = new Set<string>();
+
   // Per-connection write buffer. flush() emits one socket.write() per drain.
   out = new OutWriter(8192);
 
@@ -84,6 +94,21 @@ export class Connection {
       RESP.bulk(message),
     ];
     this.reply(this.resp3 ? { type: "push", value: items } : { type: "array", value: items });
+    this.flush();
+  }
+
+  sendInvalidation(keys: Uint8Array[] | null): void {
+    const payload: RespValue = keys === null
+      ? RESP.nil()
+      : { type: "array", value: keys.map((k) => RESP.bulk(k)) };
+    if (this.resp3) {
+      this.reply({ type: "push", value: [RESP.str("invalidation"), payload] });
+    } else {
+      this.reply({
+        type: "array",
+        value: [RESP.str("message"), RESP.str("__redis__:invalidate"), payload],
+      });
+    }
     this.flush();
   }
 

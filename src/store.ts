@@ -139,10 +139,12 @@ export type StoredValue =
 export class Database {
   data = new Map<string, StoredValue>();
   expires = new Map<string, number>();
+  hashTtls = new Map<string, Map<string, number>>();
 
   clear(): void {
     this.data.clear();
     this.expires.clear();
+    this.hashTtls.clear();
   }
 
   size(): number {
@@ -154,9 +156,27 @@ export class Database {
     if (this.isExpired(key)) {
       this.data.delete(key);
       this.expires.delete(key);
+      this.hashTtls.delete(key);
       return undefined;
     }
-    return this.data.get(key);
+    const val = this.data.get(key);
+    if (val && val.type === "hash") {
+      const ft = this.hashTtls.get(key);
+      if (ft && ft.size > 0) {
+        const now = Date.now();
+        for (const [f, exp] of ft) {
+          if (now >= exp) { val.value.delete(f); ft.delete(f); }
+        }
+        if (ft.size === 0) this.hashTtls.delete(key);
+        if (val.value.size === 0) {
+          this.data.delete(key);
+          this.expires.delete(key);
+          this.hashTtls.delete(key);
+          return undefined;
+        }
+      }
+    }
+    return val;
   }
 
   set(key: string, value: StoredValue, opts?: { keepTtl?: boolean | undefined; expireAt?: number | undefined }): void {
@@ -172,6 +192,7 @@ export class Database {
     const had = this.data.has(key);
     this.data.delete(key);
     this.expires.delete(key);
+    this.hashTtls.delete(key);
     return had;
   }
 
@@ -179,11 +200,15 @@ export class Database {
     const val = this.getRaw(src);
     if (!val) return false;
     const ttl = this.expires.get(src);
+    const ht = this.hashTtls.get(src);
     this.data.delete(src);
     this.expires.delete(src);
+    this.hashTtls.delete(src);
     this.data.set(dst, val);
     if (ttl !== undefined) this.expires.set(dst, ttl);
     else this.expires.delete(dst);
+    if (ht) this.hashTtls.set(dst, ht);
+    else this.hashTtls.delete(dst);
     return true;
   }
 
@@ -225,6 +250,7 @@ export class Database {
       if (now >= exp) {
         this.data.delete(k);
         this.expires.delete(k);
+        this.hashTtls.delete(k);
       }
     }
   }

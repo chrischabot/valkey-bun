@@ -4,7 +4,7 @@
 
 import type { CommandSpec } from "./index";
 import { RESP, type RespValue } from "../resp";
-import { bytesToKey, type Database } from "../store";
+import { bytesToKey, keyToBytes as keyToBytesLocal, type Database } from "../store";
 
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
@@ -301,6 +301,72 @@ export const listCommands: CommandSpec[] = [
   },
   { name: "BLPOP", arity: -3, handler: (ctx, conn, args) => blockingPop(ctx, conn, args, "left") },
   { name: "BRPOP", arity: -3, handler: (ctx, conn, args) => blockingPop(ctx, conn, args, "right") },
+  {
+    name: "LMPOP",
+    arity: -4,
+    handler: (ctx, conn, args) => {
+      const parsed = parseMpop(args, 0);
+      if (typeof parsed === "string") return RESP.err(parsed);
+      const r = lmpopOnce(ctx, conn, parsed.keys, parsed.side, parsed.count);
+      return r ?? RESP.arr(null);
+    },
+  },
+  {
+    name: "BLMPOP",
+    arity: -5,
+    handler: (ctx, conn, args) => {
+      const timeout = Number(dec(args[0]!));
+      if (!Number.isFinite(timeout) || timeout < 0) return RESP.err("ERR timeout is not a float or out of range");
+      const parsed = parseMpop(args, 1);
+      if (typeof parsed === "string") return RESP.err(parsed);
+      const immediate = lmpopOnce(ctx, conn, parsed.keys, parsed.side, parsed.count);
+      if (immediate) return immediate;
+      return ctx.registerWaiter(
+        conn.selectedDb, parsed.keys, timeout,
+        () => lmpopOnce(ctx, conn, parsed.keys, parsed.side, parsed.count),
+        () => RESP.arr(null),
+      ) as Promise<RespValue>;
+    },
+  },
+  {
+    name: "BLMOVE",
+    arity: 6,
+    handler: (ctx, conn, args) => {
+      const from = dec(args[2]!).toUpperCase();
+      const to = dec(args[3]!).toUpperCase();
+      if ((from !== "LEFT" && from !== "RIGHT") || (to !== "LEFT" && to !== "RIGHT")) {
+        return RESP.err("ERR syntax error");
+      }
+      const timeout = Number(dec(args[4]!));
+      if (!Number.isFinite(timeout) || timeout < 0) return RESP.err("ERR timeout is not a float or out of range");
+      const sk = bytesToKey(args[0]!);
+      const dk = bytesToKey(args[1]!);
+      const tryMove = (): RespValue | null => {
+        const moved = doLmove(ctx, conn, sk, dk, from as "LEFT" | "RIGHT", to as "LEFT" | "RIGHT");
+        return moved ? { type: "bulk", value: moved } : null;
+      };
+      const immediate = tryMove();
+      if (immediate) return immediate;
+      return ctx.registerWaiter(conn.selectedDb, [sk], timeout, tryMove, () => RESP.nil()) as Promise<RespValue>;
+    },
+  },
+  {
+    name: "BRPOPLPUSH",
+    arity: 4,
+    handler: (ctx, conn, args) => {
+      const timeout = Number(dec(args[2]!));
+      if (!Number.isFinite(timeout) || timeout < 0) return RESP.err("ERR timeout is not a float or out of range");
+      const sk = bytesToKey(args[0]!);
+      const dk = bytesToKey(args[1]!);
+      const tryMove = (): RespValue | null => {
+        const moved = doLmove(ctx, conn, sk, dk, "RIGHT", "LEFT");
+        return moved ? { type: "bulk", value: moved } : null;
+      };
+      const immediate = tryMove();
+      if (immediate) return immediate;
+      return ctx.registerWaiter(conn.selectedDb, [sk], timeout, tryMove, () => RESP.nil()) as Promise<RespValue>;
+    },
+  },
 ];
 
 function popN(ctx: any, conn: any, args: Uint8Array[], side: "left" | "right"): RespValue {
@@ -355,4 +421,63 @@ async function blockingPop(
     }
   }
   return ctx.registerListWaiter(conn.selectedDb, keys, side, timeoutRaw) as Promise<RespValue>;
+}
+
+interface MpopSpec { keys: string[]; side: "left" | "right"; count: number; }
+function parseMpop(args: Uint8Array[], start: number): MpopSpec | string {
+  const numKeys = Number(dec(args[start]!));
+  if (!Number.isInteger(numKeys) || numKeys <= 0) return "ERR numkeys should be greater than 0";
+  const keys: string[] = [];
+  for (let i = 0; i < numKeys; i++) {
+    if (start + 1 + i >= args.length) return "ERR syntax error";
+    keys.push(bytesToKey(args[start + 1 + i]!));
+  }
+  let idx = start + 1 + numKeys;
+  if (idx >= args.length) return "ERR syntax error";
+  const dirRaw = dec(args[idx]!).toUpperCase();
+  if (dirRaw !== "LEFT" && dirRaw !== "RIGHT") return "ERR syntax error";
+  const side: "left" | "right" = dirRaw === "LEFT" ? "left" : "right";
+  idx++;
+  let count = 1;
+  if (idx < args.length) {
+    if (dec(args[idx]!).toUpperCase() !== "COUNT" || idx + 1 >= args.length) return "ERR syntax error";
+    count = Number(dec(args[idx + 1]!));
+    if (!Number.isInteger(count) || count <= 0) return "ERR count should be greater than 0";
+    idx += 2;
+  }
+  if (idx !== args.length) return "ERR syntax error";
+  return { keys, side, count };
+}
+
+function lmpopOnce(ctx: any, conn: any, keys: string[], side: "left" | "right", count: number): RespValue | null {
+  const d = db(ctx, conn);
+  for (const key of keys) {
+    const list = getList(d, key);
+    if (list && list.length > 0) {
+      const out: RespValue[] = [];
+      const n = Math.min(count, list.length);
+      for (let i = 0; i < n; i++) {
+        const item = side === "left" ? list.shift()! : list.pop()!;
+        out.push({ type: "bulk", value: item });
+      }
+      if (list.length === 0) d.delete(key);
+      ctx.bumpKey(conn.selectedDb, key);
+      return RESP.arr([{ type: "bulk", value: keyToBytesLocal(key) }, RESP.arr(out)]);
+    }
+  }
+  return null;
+}
+
+function doLmove(ctx: any, conn: any, sk: string, dk: string, from: "LEFT" | "RIGHT", to: "LEFT" | "RIGHT"): Uint8Array | null {
+  const d = db(ctx, conn);
+  const src = getList(d, sk);
+  if (!src || src.length === 0) return null;
+  const item = from === "LEFT" ? src.shift()! : src.pop()!;
+  if (src.length === 0) d.delete(sk);
+  const dst = getOrCreateList(d, dk);
+  if (to === "LEFT") dst.unshift(item); else dst.push(item);
+  ctx.bumpKey(conn.selectedDb, sk);
+  ctx.bumpKey(conn.selectedDb, dk);
+  ctx.notifyListPush(conn.selectedDb, dk);
+  return item;
 }

@@ -20,6 +20,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "effect": "4.0.0-beta.70"
+    "effect": "4.0.0-beta.70",
+    "fengari": "^0.1.5"
   }
 }
