@@ -157,6 +157,23 @@ subscribe mode, only `(P|S)SUBSCRIBE`, `(P|S)UNSUBSCRIBE`, `PING`, `QUIT`,
 `PING` while subscribed replies `["pong", ""]` (array) in RESP2 and `+PONG` in
 RESP3.
 
+### Other out-of-band frames
+
+- **Client-side caching invalidation** (`CLIENT TRACKING`): a RESP3 **push**
+  `>2\r\n$12\r\ninvalidation\r\n*<n>\r\n<keys…>`; a `FLUSHDB`/`FLUSHALL` flush
+  uses a `$-1` null-bulk as the second element instead of the key array. When
+  tracking with `REDIRECT` to a RESP2 connection, the same payload arrives as
+  a normal `message __redis__:invalidate <keys|$-1>` array on that
+  connection.
+- **Keyspace notifications** (`notify-keyspace-events`): ordinary pub/sub
+  `message` frames on `__keyspace@<db>__:<key>` (payload = event name) and
+  `__keyevent@<db>__:<event>` (payload = key). Subscribe with
+  `PSUBSCRIBE __key*@0__:*`.
+
+Both are delivered through the standard pub/sub push path and require the
+client to be reading the connection out-of-band, exactly like
+`message`/`pmessage`.
+
 ## A complete annotated exchange
 
 Client (`SET foo bar`, then `GET foo`):

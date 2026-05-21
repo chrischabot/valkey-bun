@@ -1,7 +1,7 @@
 # Generic Key Commands
 
 Operate on keys regardless of value type: existence, expiry, iteration,
-renaming, and cross-database moves.
+renaming, cross-database moves, serialization, and sorting.
 
 ---
 
@@ -24,18 +24,35 @@ idletime tracked).
 
 ## EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT
 
-- `EXPIRE key seconds` · `PEXPIRE key millis` (relative)
-- `EXPIREAT key ts-seconds` · `PEXPIREAT key ts-millis` (absolute UNIX)
+- `EXPIRE key seconds [NX|XX|GT|LT]` · `PEXPIRE key millis [NX|XX|GT|LT]`
+  (relative)
+- `EXPIREAT key ts-seconds [NX|XX|GT|LT]` ·
+  `PEXPIREAT key ts-millis [NX|XX|GT|LT]` (absolute UNIX)
 - Arity ≥ 3
 
 Set a key's TTL. Non-numeric time → `ERR value is not an integer or out of
-range`. **Reply:** `:1` if the timeout was set, `:0` if the key does not
-exist.
+range`. The optional Redis 7.x condition flag:
+
+- `NX` — only if the key has **no** TTL.
+- `XX` — only if the key **already** has a TTL.
+- `GT` — only if the new expiry is **greater** than the current one.
+- `LT` — only if the new expiry is **less** than the current one.
+
+A key with no TTL is treated as **+infinity** for `GT`/`LT`: so `GT` never
+sets a persistent key, and `LT` always does. `NX` is incompatible with
+`XX`/`GT`/`LT`, and `GT` with `LT` (→ `ERR ... not compatible`); an unknown
+flag → `ERR Unsupported option <X>`.
+
+**Reply:** `:1` if the timeout was set, `:0` if not (key missing or the
+condition was not met).
 
 ```bash
 SET k v
-EXPIRE k 100   # 1
-TTL k          # 100
+EXPIRE k 100        # (integer) 1
+EXPIRE k 50 GT      # (integer) 0   (50 < 100)
+EXPIRE k 200 GT     # (integer) 1
+EXPIRE k 10 NX      # (integer) 0   (already has a TTL)
+TTL k               # (integer) ~200  (unchanged by the failed NX)
 ```
 
 ## EXPIRETIME / PEXPIRETIME
@@ -111,7 +128,8 @@ swept first).
 `FLUSHDB [ASYNC|SYNC]` · `FLUSHALL [ASYNC|SYNC]` · Arity ≥ 1
 
 Clear the selected DB / all DBs (and reset `WATCH` key-versions). The
-`ASYNC`/`SYNC` argument is accepted and ignored. **Reply:** `+OK`.
+`ASYNC`/`SYNC` argument is accepted and ignored. **Reply:** `+OK`. Also emits
+a client-cache flush invalidation to `CLIENT TRACKING` clients.
 
 ## OBJECT
 
@@ -142,6 +160,77 @@ out-of-range DB → `ERR DB index is out of range`; same DB →
 `ERR source and destination objects are the same`. **Reply:** `:1` moved,
 `:0` if the source is missing or the destination already has the key.
 
+## DUMP
+
+`DUMP key` · Arity 2
+
+Serialize the value at `key` into a portable, versioned, CRC-checked payload
+(valkey2's own internal format — see [persistence.md](../persistence.md) — not
+the binary redis-server RDB layout, so it round-trips within valkey2 but not
+across to redis-server). **Reply:** the serialized bulk string, or nil if the
+key is absent.
+
+## RESTORE
+
+`RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]`
+· Arity ≥ 4
+
+Recreate `key` from a `DUMP` payload. `ttl` is milliseconds (`0` = no
+expiry); with `ABSTTL` it is an absolute UNIX-ms timestamp. `REPLACE`
+overwrites an existing key (otherwise `BUSYKEY Target key name already
+exists.`). `IDLETIME`/`FREQ` are accepted and ignored. A negative/invalid
+`ttl` → `ERR Invalid TTL value, must be >= 0`; a corrupt payload →
+`ERR DUMP payload version or checksum are wrong`. **Reply:** `+OK`.
+
+```bash
+SET k hello
+DUMP k                       # "<binary payload>"
+RESTORE k2 0 "<payload>"     # OK
+GET k2                       # "hello"
+```
+
+## SORT / SORT_RO
+
+`SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC|DESC] [ALPHA] [STORE destination]`
+· Arity ≥ 2
+`SORT_RO key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC] [ALPHA]`
+· Arity ≥ 2
+
+Sort the elements of a `list`, `set`, or `zset`.
+
+- Default: **numeric** sort — every element (or `BY` value) must parse as a
+  double, else `ERR One or more scores can't be converted into double`.
+- `ALPHA`: lexicographic (byte) sort.
+- `BY pattern`: sort by the value an external key/hash field yields, where
+  the first `*` in `pattern` is replaced by the element (`key->field`
+  selects a hash field). A `BY` pattern with **no `*`** disables sorting
+  (Redis "dontsort"). A missing `BY` lookup contributes score `0` in numeric
+  mode (and sorts first in `ALPHA`), exactly like redis-server.
+- `LIMIT offset count`: paginate (offset ≥ 0; integers required).
+- `GET pattern`: project each result through the pattern (`#` = the element
+  itself); a missing projection is nil (or an empty string in the `STORE`
+  list, since a Redis list cannot hold nil).
+- `ASC` (default) / `DESC`: order.
+- `STORE destination`: store the result as a list and reply the count
+  (an empty result deletes `destination`; the destination is created fresh
+  with no TTL). `SORT_RO` rejects `STORE` (`ERR SORT_RO is read-only`).
+
+**Reply:** array of (projected) elements; with `STORE`, the integer length of
+the stored list.
+
+```bash
+RPUSH mylist 3 1 2
+SORT mylist                       # 1) "1" 2) "2" 3) "3"
+SORT mylist LIMIT 0 2 DESC        # 1) "3" 2) "2"
+RPUSH names banana apple cherry
+SORT names ALPHA                  # 1) "apple" 2) "banana" 3) "cherry"
+SORT mylist STORE sorted          # (integer) 3
+LRANGE sorted 0 -1                # 1) "1" 2) "2" 3) "3"
+# BY / GET against external keys:
+MSET weight_1 10 weight_2 5 weight_3 1 data_1 A data_2 B data_3 C
+SORT mylist BY weight_* GET data_* GET #   # projected by ascending weight
+```
+
 ### TypeScript sample
 
 ```ts
@@ -154,5 +243,7 @@ console.log(await r.type("u:1"));           // "string"
 let [cursor, keys] = await r.scan(0, "MATCH", "u:*", "COUNT", 100);
 console.log(keys);                          // ["u:1","u:2"]
 await r.copy("u:1", "u:1:bak");
+const payload = await r.callBuffer("DUMP", "u:1");
+await r.call("RESTORE", "u:1:restored", "0", payload);
 r.disconnect();
 ```

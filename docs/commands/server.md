@@ -1,8 +1,11 @@
 # Server & Administrative Commands
 
-Introspection and administration. Many persistence/cluster commands are
-accepted as no-ops for client compatibility (valkey2 is ephemeral and
-single-node — see [deployment.md](../deployment.md)).
+Introspection and administration. Persistence commands are functional on a
+normal server launch (the data directory defaults to `.`, so RDB save-rules
+and — when `appendonly=yes` — the AOF are active); they are accepted no-ops
+only in the embedded/in-process mode used by the test harness. Cluster/
+replication commands report a standalone node — see
+[deployment.md](../deployment.md) and [persistence.md](../persistence.md).
 
 ---
 
@@ -14,18 +17,28 @@ single-node — see [deployment.md](../deployment.md)).
 include `Server` (`redis_version` `7.4.0`, `redis_mode` `standalone`, pid,
 uptime, tcp_port…), `Clients` (`connected_clients`, `maxclients`), `Memory`
 (`used_memory`, `maxmemory` `0`, `maxmemory_policy` `noeviction`),
-`Persistence` (all zero/disabled), `Stats` (`total_commands_processed`…),
-`Replication` (`role:master`), `CPU`, and `Keyspace` (`dbN:keys=…,expires=…`).
-The optional section argument is accepted; the full document is returned.
+`Persistence`, `Stats` (`total_commands_processed`…), `Replication`
+(`role:master`), `CPU`, and `Keyspace` (`dbN:keys=…,expires=…`). The optional
+section argument is accepted; the full document is returned.
 
 ## COMMAND
 
 `COMMAND [subcommand]` · Arity ≥ 1
 
 - No args → empty array.
-- `COUNT` → `:200` (approximate). `LIST` → empty array. `GETKEYS` → empty
-  array. `DOCS` → empty map (RESP3) / array (RESP2). `INFO name [...]` →
-  array of nils.
+- `COUNT` → the **actual** number of registered commands.
+- `LIST` → an array of every registered command name (lowercased).
+- `GETKEYS cmd arg [arg ...]` → a **compatibility-oriented, partial**
+  implementation that returns the best-effort first key (`args[2]`); it does
+  not perform full Redis key-spec parsing for multi-key/variadic commands.
+  Fewer than 3 tokens → `ERR Invalid command specified`.
+- `DOCS` → empty map (RESP3) / array (RESP2). `INFO name [...]` → array of
+  nils.
+
+```bash
+COMMAND COUNT          # (integer) <registry size>
+COMMAND GETKEYS set k v # 1) "k"
+```
 
 ## CONFIG
 
@@ -34,11 +47,18 @@ The optional section argument is accepted; the full document is returned.
 
 In-memory config map (see [configuration.md](../configuration.md)). `GET`
 supports glob patterns; `SET` updates the map; `RESETSTAT`/`REWRITE` →
-`+OK` (no config file exists).
+`+OK` (no config file exists). Two `SET` keys have **runtime side effects**:
+
+- `CONFIG SET appendonly yes|no` — enables/disables AOF at runtime (enabling
+  snapshots the current dataset as the new AOF base).
+- `CONFIG SET notify-keyspace-events <flags>` — changes keyspace-notification
+  delivery immediately.
 
 ```bash
-CONFIG GET maxmemory          # 1) "maxmemory" 2) "0"
-CONFIG SET maxmemory 100mb    # OK
+CONFIG GET maxmemory                 # 1) "maxmemory" 2) "0"
+CONFIG SET maxmemory 100mb           # OK
+CONFIG SET appendonly yes        # OK — enables the AOF at runtime
+CONFIG SET notify-keyspace-events KEA   # OK — applies immediately
 ```
 
 ## DEBUG
@@ -59,28 +79,31 @@ CONFIG SET maxmemory 100mb    # OK
 `SWAPDB index1 index2` · Arity 3 → `+OK`; atomically swaps two databases.
 Out-of-range → `ERR DB index is out of range`.
 
-## Persistence (no-ops)
+## Persistence
 
-| Command | Reply |
-|---------|-------|
-| `SAVE` | `+OK` |
-| `BGSAVE` | `+Background saving started` |
-| `BGREWRITEAOF` | `+Background append only file rewriting started` |
-| `LASTSAVE` | server start time (integer seconds) |
+On a normal launch these are wired to the AOF/RDB subsystem (see
+[persistence.md](../persistence.md)); only in the embedded/in-process test
+mode (no data directory) are they accepted no-ops so tooling clients do not
+error.
 
-valkey2 has no on-disk persistence; these exist only so backup/tooling
-clients do not error.
+| Command | Behavior |
+|---------|----------|
+| `SAVE` | Synchronous RDB snapshot → `+OK` |
+| `BGSAVE` | Snapshot serialized then written/fsynced off the hot path → `+Background saving started` |
+| `BGREWRITEAOF` | Rewrite the AOF to a minimal `RESTORE`-per-key form → `+Background append only file rewriting started` |
+| `LASTSAVE` | Integer UNIX seconds of the last successful save |
+| `WAITAOF numlocal numreplicas timeout` | `[aof-enabled?1:0, 0]` (no replicas) |
 
 ## SHUTDOWN
 
 `SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]` · Arity ≥ 1
 
-Stop the server. Any optional arguments (`NOSAVE`/`SAVE`/`NOW`/`FORCE`/
-`ABORT`) are accepted and ignored — there is nothing to persist. **Reply:**
-`+OK`, then the process exits (`process.exit(0)`) after ~50 ms, which lets the
-reply flush to the client first. In cluster mode this terminates the worker
-that handled the command; send `SIGTERM`/`SIGINT` to the master for a full
-graceful shutdown (see [deployment.md](../deployment.md)).
+Stop the server. Optional arguments are accepted. If persistence is
+configured the AOF is flushed and an RDB written before exit. **Reply:**
+`+OK`, then the process exits (`process.exit(0)`) after ~50 ms so the reply
+flushes first. In cluster mode this terminates the worker that handled the
+command; send `SIGTERM`/`SIGINT` to the master for a full graceful shutdown
+(see [deployment.md](../deployment.md)).
 
 ## MEMORY
 
@@ -125,6 +148,7 @@ graceful shutdown (see [deployment.md](../deployment.md)).
 
 ```bash
 redis-cli -p 6379 INFO Server | head
+redis-cli -p 6379 COMMAND COUNT
 redis-cli -p 6379 CONFIG GET 'maxmemory*'
 redis-cli -p 6379 TIME
 redis-cli -p 6379 DEBUG SLEEP 0.2

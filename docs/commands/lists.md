@@ -12,7 +12,8 @@ Arity ≥ 3
 
 Prepend (`LPUSH`) or append (`RPUSH`) elements, creating the list if absent.
 Multiple elements are inserted in order. **Reply:** integer new length. A push
-also wakes a blocked `BLPOP`/`BRPOP` waiter (see below).
+also wakes a blocked `BLPOP`/`BRPOP`/`BLMOVE`/`BRPOPLPUSH`/`BLMPOP` waiter
+(see below).
 
 ## LPUSHX / RPUSHX
 
@@ -129,8 +130,8 @@ any of the keys or `timeout` (seconds; `0` = block forever) elapses.
 
 - Available immediately → returns at once.
 - Negative/invalid timeout → `ERR timeout is not a float or out of range`.
-- A push (`LPUSH`/`RPUSH`/`LPUSHX`/`RPUSHX`/`LMOVE`/`RPOPLPUSH`) wakes exactly
-  one waiter, FIFO.
+- A push or element-adding move (`LPUSH`/`RPUSH`/`LPUSHX`/`RPUSHX`/`LMOVE`/
+  `RPOPLPUSH`/`BLMOVE`/`BRPOPLPUSH`) wakes exactly one waiter, FIFO.
 - The blocked connection correctly defers its subsequent commands until it
   unblocks (per-connection ordering preserved).
 
@@ -146,5 +147,73 @@ await boss.rpush("jobs", "task-1");
 console.log(await pending);                 // ["jobs", "task-1"]
 
 console.log(await worker.blpop("none", 1)); // null after ~1s timeout
+worker.disconnect(); boss.disconnect();
+```
+
+## BLMOVE
+
+`BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout` · Arity 6
+
+Blocking variant of `LMOVE`. If `source` has an element, atomically pop from
+the chosen end and push to the chosen end of `destination`, returning the
+moved element immediately. Otherwise the client **blocks** until an element
+is pushed to `source` or `timeout` seconds elapse (`0` = block forever).
+Invalid direction → `ERR syntax error`; negative/invalid timeout →
+`ERR timeout is not a float or out of range`. The push to `destination` wakes
+other blocked waiters.
+
+**Reply:** the moved element (bulk), or nil on timeout.
+
+```ts
+const moved = worker.blmove("src", "dst", "LEFT", "RIGHT", 0); // blocks
+await boss.rpush("src", "x");
+console.log(await moved);                    // "x"
+```
+
+## BRPOPLPUSH
+
+`BRPOPLPUSH source destination timeout` · Arity 4
+
+Blocking variant of `RPOPLPUSH` — equivalent to
+`BLMOVE source destination RIGHT LEFT timeout`. **Reply:** the moved element
+(bulk), or nil on timeout.
+
+## LMPOP
+
+`LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]` · Arity ≥ 4
+
+Pop from the first non-empty list among `numkeys` keys, from the head
+(`LEFT`) or tail (`RIGHT`). `COUNT` (default 1, must be > 0) bounds how many
+elements are popped. `numkeys` must be > 0. Bad arguments →
+`ERR numkeys should be greater than 0` / `ERR count should be greater than 0`
+/ `ERR syntax error`. The list is deleted when emptied.
+
+**Reply:** a 2-element array `[key, [elements...]]`, or `*-1` (null array) if
+all lists are empty/absent.
+
+```bash
+RPUSH a 1 2 3
+LMPOP 2 nokey a LEFT COUNT 2   # 1) "a" 2) 1) "1" 2) "2"
+```
+
+## BLMPOP
+
+`BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]` · Arity ≥ 5
+
+Blocking `LMPOP`. Returns immediately if any list has elements; otherwise
+**blocks** until a push to any of the keys or `timeout` seconds elapse
+(`0` = forever). Negative/invalid timeout →
+`ERR timeout is not a float or out of range`.
+
+**Reply:** `[key, [elements...]]`, or `*-1` (null array) on timeout.
+
+```ts
+import { Redis } from "ioredis";
+const worker = new Redis({ port: 6379 });
+const boss = new Redis({ port: 6379 });
+
+const p = worker.call("BLMPOP", "0", "1", "tasks", "LEFT", "COUNT", "2");
+await boss.rpush("tasks", "j1", "j2");
+console.log(await p);                       // ["tasks", ["j1", "j2"]]
 worker.disconnect(); boss.disconnect();
 ```

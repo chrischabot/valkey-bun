@@ -124,9 +124,17 @@ so even `printf 'PING\r\n' | nc 127.0.0.1 6379` works.
 ## Verify the install
 
 ```bash
-bun test          # 46 integration tests across ioredis + node-redis + sample app
+bun test          # 60 integration tests across 4 suites (ioredis, node-redis, sample-app, scripting)
 bun run typecheck # strict tsc --noEmit, must exit 0
 ```
+
+Beyond the core data types, valkey2 also implements persistence
+(AOF + RDB, see [persistence.md](./persistence.md)), Lua scripting &
+Functions (`EVAL`/`EVALSHA`/`SCRIPT`/`FUNCTION`/`FCALL`, see
+[commands/scripting.md](./commands/scripting.md)), keyspace notifications and
+RESP3 `CLIENT TRACKING` (see
+[client-side-caching.md](./client-side-caching.md)), bitmaps, HyperLogLog,
+geo, and Redis 7.4 hash-field TTL.
 
 Check the admin endpoint (HTTP/1.1 over TLS works on the same port; the
 self-signed dev cert means `-k`):

@@ -64,18 +64,64 @@ Out-of-range/invalid → `ERR DB index is out of range`.
 | `SETNAME name` | `+OK` |
 | `INFO` | `id=… name=… db=…` (bulk) |
 | `LIST` | one line per connection (`id=… name=… db=…`) |
-| `SETINFO` / `NO-EVICT` / `NO-TOUCH` / `REPLY` / `PAUSE` / `UNPAUSE` / `TRACKING` / `KILL` | `+OK` (accepted, mostly no-ops) |
-| `GETREDIR` | `:-1` |
+| `SETINFO` / `NO-EVICT` / `NO-TOUCH` / `REPLY` / `PAUSE` / `UNPAUSE` / `KILL` | `+OK` (accepted, no-ops) |
+| `GETREDIR` | the tracking redirect client id, or `-1` if tracking is off |
+| `TRACKING …` | enable/disable client-side-caching tracking (see below) |
+| `CACHING YES\|NO` | per-read opt for `OPTIN`/`OPTOUT` tracking |
 | `TRACKINGINFO` | map: `flags`/`redirect`/`prefixes` |
 | _unknown_ | `ERR Unknown CLIENT subcommand` |
+
+### CLIENT TRACKING (RESP3 client-side caching)
+
+`CLIENT TRACKING ON|OFF [REDIRECT id] [PREFIX p [PREFIX p ...]] [BCAST] [OPTIN] [OPTOUT] [NOLOOP]`
+
+Turn invalidation tracking on/off for the connection. When on, the server
+sends an **invalidation message** when a key the client may have cached
+changes:
+
+- **Default mode:** keys the client *reads* are remembered; a later mutation
+  to such a key invalidates it (one-shot — re-read to re-track).
+- **`BCAST` mode:** no per-key bookkeeping; the client is notified for every
+  changed key matching one of its `PREFIX`es (or all keys if none given).
+- `OPTIN`/`OPTOUT` (default mode only) gate tracking on
+  `CLIENT CACHING YES|NO` issued immediately before the read.
+- `REDIRECT id` delivers invalidations to another connection (which must
+  exist, else `ERR The client ID you want redirect to does not exist`).
+- `NOLOOP` suppresses the notification to the client that performed the
+  write.
+
+Validation errors: `ERR You can't specify both OPTIN mode and OPTOUT mode`;
+`ERR PREFIX option requires BCAST mode to be enabled`;
+`ERR OPTIN and OPTOUT are not compatible with BCAST`. Re-issuing
+`CLIENT TRACKING ON` first clears prior tracked-key state.
+
+Invalidation wire form: a RESP3 push `>2 "invalidation" [keys]` (or, for a
+RESP2 redirect target, `message __redis__:invalidate [keys]`).
+`FLUSHDB`/`FLUSHALL` send a flush signal (`["invalidation", nil]`).
+
+`CLIENT TRACKINGINFO` → map with `flags` (e.g. `on`, `bcast`, `optin`,
+`optout`, `noloop`, `caching-yes`/`caching-no`), `redirect`
+(id or `-1`), `prefixes`. `CLIENT GETREDIR` → the redirect id (`-1` if not
+tracking). `RESET` and disconnect clear all tracking state.
+
+See [client-side-caching.md](../client-side-caching.md) for the full guide.
+
+```bash
+HELLO 3
+CLIENT TRACKING ON BCAST PREFIX user:
+# another client: SET user:1 alice
+#  -> this client receives:  >2 "invalidation" ["user:1"]
+CLIENT TRACKINGINFO
+CLIENT TRACKING OFF
+```
 
 ## RESET
 
 `RESET` · Arity 1 → `+RESET`
 
 Return the connection to a clean state: unsubscribe all, exit `MULTI`, clear
-the queue/errors, clear `WATCH`, `SELECT 0`, clear the name. Allowed in
-subscribe mode.
+the queue/errors, clear `WATCH`, clear all `CLIENT TRACKING` state,
+`SELECT 0`, clear the name. Allowed in subscribe mode.
 
 ## QUIT
 
