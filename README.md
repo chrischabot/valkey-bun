@@ -109,6 +109,11 @@ The tests call `startTcpServer` directly on dedicated ports and drive the server
 
 [docs/README.md](docs/README.md) indexes everything. The [command reference](docs/commands/README.md) gives the syntax, replies and RESP2/RESP3 differences for every command, the [protocol guide](docs/protocol.md) describes the wire format at byte level, and [deployment](docs/deployment.md), the [admin endpoint](docs/admin-http.md), [client-side caching](docs/client-side-caching.md) and the [design roadmap](docs/roadmap.md) each have their own page.
 
+## Project background
+
+- [valkey-bun project overview](https://chabot.dev/projects/#valkey-bun) on Chris Chabot’s site.
+- [Local Redis starts at the client](https://chabot.dev/blog/local-redis-starts-at-the-client/): client negotiation, RESP compatibility and ordered replies.
+
 ## License and credits
 
 valkey-bun is released under the [MIT License](LICENSE), copyright 2026 Chris Chabot.
